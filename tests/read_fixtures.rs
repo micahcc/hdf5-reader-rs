@@ -181,6 +181,437 @@ fn open_by_path() {
     }
 }
 
+// ── Chunked data read ──
+
+#[test]
+fn read_chunked_single_chunk_shuffle_deflate() {
+    let file = File::open(fixture("shuffle_deflate_v3.h5")).unwrap();
+    let root = file.root_group().unwrap();
+    let ds = root.dataset("shuffled").unwrap();
+
+    assert_eq!(ds.shape().unwrap(), vec![20]);
+
+    let raw = ds.read_raw().unwrap();
+    assert_eq!(raw.len(), 80); // 20 * 4 bytes (f32)
+
+    let values: Vec<f32> = raw
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    let expected: Vec<f32> = (0..20).map(|i| i as f32 * 1.5).collect();
+    assert_eq!(values, expected);
+}
+
+#[test]
+fn read_chunked_fixed_array_deflate() {
+    let file = File::open(fixture("chunked_deflate_v3.h5")).unwrap();
+    let root = file.root_group().unwrap();
+    let ds = root.dataset("compressed").unwrap();
+
+    assert_eq!(ds.shape().unwrap(), vec![10, 10]);
+
+    let raw = ds.read_raw().unwrap();
+    assert_eq!(raw.len(), 400); // 100 * 4 bytes (i32)
+
+    let values: Vec<i32> = raw
+        .chunks_exact(4)
+        .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    let expected: Vec<i32> = (0..100).collect();
+    assert_eq!(values, expected);
+}
+
+#[test]
+fn read_chunked_extensible_array() {
+    let file = File::open(fixture("extensible_array.h5")).unwrap();
+    let root = file.root_group().unwrap();
+    let ds = root.dataset("extarray").unwrap();
+
+    assert_eq!(ds.shape().unwrap(), vec![15]);
+
+    let raw = ds.read_raw().unwrap();
+    assert_eq!(raw.len(), 60); // 15 * 4 bytes (i32)
+
+    let values: Vec<i32> = raw
+        .chunks_exact(4)
+        .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    let expected: Vec<i32> = (1..=15).map(|i| i * 100).collect();
+    assert_eq!(values, expected);
+}
+
+#[test]
+fn read_chunked_btree_v1_deflate() {
+    let file = File::open(fixture("chunked_btree_v1.h5")).unwrap();
+    let root = file.root_group().unwrap();
+    let ds = root.dataset("chunked_v3").unwrap();
+
+    assert_eq!(ds.shape().unwrap(), vec![12]);
+
+    let raw = ds.read_raw().unwrap();
+    assert_eq!(raw.len(), 48); // 12 * 4 bytes (i32)
+
+    let values: Vec<i32> = raw
+        .chunks_exact(4)
+        .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    let expected: Vec<i32> = (1..=12).map(|i| i * 10).collect();
+    assert_eq!(values, expected);
+}
+
+// ── Implicit chunk index ──
+
+#[test]
+fn read_chunked_implicit() {
+    let file = File::open(fixture("implicit_chunks.h5")).unwrap();
+    let root = file.root_group().unwrap();
+    let ds = root.dataset("implicit").unwrap();
+
+    assert_eq!(ds.shape().unwrap(), vec![8]);
+
+    let raw = ds.read_raw().unwrap();
+    assert_eq!(raw.len(), 64); // 8 * 8 bytes (f64)
+
+    let values: Vec<f64> = raw
+        .chunks_exact(8)
+        .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    let expected = vec![1.1, 2.2, 3.3, 4.4, 5.5, 6.6, 7.7, 8.8];
+    assert_eq!(values, expected);
+}
+
+// ── 2D edge chunks ──
+
+#[test]
+fn read_chunked_2d_edge() {
+    let file = File::open(fixture("edge_chunks.h5")).unwrap();
+    let root = file.root_group().unwrap();
+    let ds = root.dataset("edge").unwrap();
+
+    assert_eq!(ds.shape().unwrap(), vec![7, 5]);
+
+    let raw = ds.read_raw().unwrap();
+    assert_eq!(raw.len(), 140); // 35 * 4 bytes (i32)
+
+    let values: Vec<i32> = raw
+        .chunks_exact(4)
+        .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    let expected: Vec<i32> = (0..35).collect();
+    assert_eq!(values, expected);
+}
+
+// ── Compound datatype ──
+
+#[test]
+fn read_compound_metadata() {
+    let file = File::open(fixture("compound.h5")).unwrap();
+    let root = file.root_group().unwrap();
+    let ds = root.dataset("points").unwrap();
+
+    let dt = ds.datatype().unwrap();
+    match &dt {
+        Datatype::Compound { size, members } => {
+            assert_eq!(*size, 12); // sizeof(Point) = 4+4+4
+            assert_eq!(members.len(), 3);
+            assert_eq!(members[0].name, "id");
+            assert_eq!(members[0].byte_offset, 0);
+            assert_eq!(members[1].name, "x");
+            assert_eq!(members[1].byte_offset, 4);
+            assert_eq!(members[2].name, "y");
+            assert_eq!(members[2].byte_offset, 8);
+        }
+        other => panic!("expected Compound, got {:?}", other),
+    }
+}
+
+#[test]
+fn read_compound_data() {
+    let file = File::open(fixture("compound.h5")).unwrap();
+    let root = file.root_group().unwrap();
+    let ds = root.dataset("points").unwrap();
+    let raw = ds.read_raw().unwrap();
+
+    assert_eq!(raw.len(), 36); // 3 * 12 bytes
+
+    // Parse each 12-byte record: { id: i32, x: f32, y: f32 }
+    for (i, record) in raw.chunks_exact(12).enumerate() {
+        let id = i32::from_le_bytes(record[0..4].try_into().unwrap());
+        let x = f32::from_le_bytes(record[4..8].try_into().unwrap());
+        let y = f32::from_le_bytes(record[8..12].try_into().unwrap());
+
+        assert_eq!(id, (i + 1) as i32);
+        assert_eq!(x, (2 * i + 1) as f32);
+        assert_eq!(y, (2 * i + 2) as f32);
+    }
+}
+
+// ── Enum datatype ──
+
+#[test]
+fn read_enum_metadata() {
+    let file = File::open(fixture("enum.h5")).unwrap();
+    let root = file.root_group().unwrap();
+    let ds = root.dataset("colors").unwrap();
+
+    let dt = ds.datatype().unwrap();
+    match &dt {
+        Datatype::Enum { base, members } => {
+            // Base type: i8
+            match base.as_ref() {
+                Datatype::FixedPoint { size, signed, .. } => {
+                    assert_eq!(*size, 1);
+                    assert!(signed);
+                }
+                other => panic!("expected FixedPoint base, got {:?}", other),
+            }
+            assert_eq!(members.len(), 3);
+            assert_eq!(members[0].name, "RED");
+            assert_eq!(members[0].value, vec![0i8 as u8]);
+            assert_eq!(members[1].name, "GREEN");
+            assert_eq!(members[1].value, vec![1i8 as u8]);
+            assert_eq!(members[2].name, "BLUE");
+            assert_eq!(members[2].value, vec![2i8 as u8]);
+        }
+        other => panic!("expected Enum, got {:?}", other),
+    }
+}
+
+#[test]
+fn read_enum_data() {
+    let file = File::open(fixture("enum.h5")).unwrap();
+    let root = file.root_group().unwrap();
+    let ds = root.dataset("colors").unwrap();
+    let raw = ds.read_raw().unwrap();
+
+    assert_eq!(raw.len(), 5); // 5 * 1 byte (i8)
+    assert_eq!(raw, vec![0, 1, 2, 1, 0]); // RED, GREEN, BLUE, GREEN, RED
+}
+
+// ── Array datatype ──
+
+#[test]
+fn read_array_metadata() {
+    let file = File::open(fixture("array.h5")).unwrap();
+    let root = file.root_group().unwrap();
+    let ds = root.dataset("vectors").unwrap();
+
+    let dt = ds.datatype().unwrap();
+    match &dt {
+        Datatype::Array {
+            element_type,
+            dimensions,
+        } => {
+            assert_eq!(dimensions, &[3]);
+            match element_type.as_ref() {
+                Datatype::FixedPoint { size, signed, .. } => {
+                    assert_eq!(*size, 4);
+                    assert!(signed);
+                }
+                other => panic!("expected FixedPoint element, got {:?}", other),
+            }
+            // element_size should be 3 * 4 = 12
+            assert_eq!(dt.element_size(), 12);
+        }
+        other => panic!("expected Array, got {:?}", other),
+    }
+}
+
+#[test]
+fn read_array_data() {
+    let file = File::open(fixture("array.h5")).unwrap();
+    let root = file.root_group().unwrap();
+    let ds = root.dataset("vectors").unwrap();
+    let raw = ds.read_raw().unwrap();
+
+    assert_eq!(raw.len(), 48); // 4 * 3 * 4 bytes (4 arrays of 3 i32)
+
+    let values: Vec<i32> = raw
+        .chunks_exact(4)
+        .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    let expected: Vec<i32> = (1..=12).collect();
+    assert_eq!(values, expected);
+}
+
+// ── Fletcher32 checksum filter ──
+
+#[test]
+fn read_fletcher32_chunked() {
+    let file = File::open(fixture("fletcher32.h5")).unwrap();
+    let root = file.root_group().unwrap();
+    let ds = root.dataset("checksummed").unwrap();
+
+    assert_eq!(ds.shape().unwrap(), vec![10]);
+
+    let raw = ds.read_raw().unwrap();
+    assert_eq!(raw.len(), 40); // 10 * 4 bytes (i32)
+
+    let values: Vec<i32> = raw
+        .chunks_exact(4)
+        .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    let expected: Vec<i32> = (1..=10).map(|i| i * 100).collect();
+    assert_eq!(values, expected);
+}
+
+// ── Variable-length types ──
+
+#[test]
+fn read_vlen_string_metadata() {
+    let file = File::open(fixture("vlen_strings.h5")).unwrap();
+    let root = file.root_group().unwrap();
+    let ds = root.dataset("names").unwrap();
+
+    let dt = ds.datatype().unwrap();
+    match &dt {
+        Datatype::VarLen {
+            is_string,
+            char_set,
+            ..
+        } => {
+            assert!(is_string);
+            assert_eq!(
+                *char_set,
+                Some(hdf5_reader::datatype::CharacterSet::Utf8)
+            );
+        }
+        other => panic!("expected VarLen, got {:?}", other),
+    }
+
+    assert_eq!(ds.shape().unwrap(), vec![4]);
+}
+
+#[test]
+fn read_vlen_strings() {
+    let file = File::open(fixture("vlen_strings.h5")).unwrap();
+    let root = file.root_group().unwrap();
+    let ds = root.dataset("names").unwrap();
+
+    let strings = ds.read_vlen_strings().unwrap();
+    assert_eq!(strings, vec!["hello", "world", "HDF5", "variable-length"]);
+}
+
+#[test]
+fn read_vlen_sequence_metadata() {
+    let file = File::open(fixture("vlen_sequence.h5")).unwrap();
+    let root = file.root_group().unwrap();
+    let ds = root.dataset("sequences").unwrap();
+
+    let dt = ds.datatype().unwrap();
+    match &dt {
+        Datatype::VarLen {
+            element_type,
+            is_string,
+            ..
+        } => {
+            assert!(!is_string);
+            assert_eq!(element_type.element_size(), 4);
+        }
+        other => panic!("expected VarLen, got {:?}", other),
+    }
+
+    assert_eq!(ds.shape().unwrap(), vec![3]);
+}
+
+#[test]
+fn read_vlen_sequence_data() {
+    let file = File::open(fixture("vlen_sequence.h5")).unwrap();
+    let root = file.root_group().unwrap();
+    let ds = root.dataset("sequences").unwrap();
+
+    let vlen_data = ds.read_vlen().unwrap();
+    assert_eq!(vlen_data.len(), 3);
+
+    // Sequence 0: [10, 20]
+    let seq0: Vec<i32> = vlen_data[0]
+        .chunks_exact(4)
+        .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    assert_eq!(seq0, vec![10, 20]);
+
+    // Sequence 1: [100, 200, 300, 400]
+    let seq1: Vec<i32> = vlen_data[1]
+        .chunks_exact(4)
+        .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    assert_eq!(seq1, vec![100, 200, 300, 400]);
+
+    // Sequence 2: [42]
+    let seq2: Vec<i32> = vlen_data[2]
+        .chunks_exact(4)
+        .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    assert_eq!(seq2, vec![42]);
+}
+
+// ── Fill value ──
+
+#[test]
+fn read_fill_value() {
+    let file = File::open(fixture("fill_value.h5")).unwrap();
+    let root = file.root_group().unwrap();
+    let ds = root.dataset("filled").unwrap();
+
+    let fv = ds.fill_value().unwrap();
+    assert!(fv.defined);
+    let val_bytes = fv.value.expect("expected fill value bytes");
+    assert_eq!(val_bytes.len(), 4);
+    let fill_val = i32::from_le_bytes(val_bytes.try_into().unwrap());
+    assert_eq!(fill_val, -999);
+
+    // Also read the data
+    let raw = ds.read_raw().unwrap();
+    let values: Vec<i32> = raw
+        .chunks_exact(4)
+        .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    assert_eq!(values, vec![10, 20, 30, 40, -999, -999]);
+}
+
+// ── Dense attributes ──
+
+#[test]
+fn read_dense_attributes() {
+    let file = File::open(fixture("dense_attributes.h5")).unwrap();
+    let root = file.root_group().unwrap();
+    let grp = root.group("densegroup").unwrap();
+
+    let attrs = grp.attributes().unwrap();
+    assert_eq!(attrs.len(), 8);
+
+    // Verify all 8 attributes exist with correct values
+    for i in 0..8 {
+        let name = format!("attr_{:02}", i);
+        let attr = attrs.iter().find(|a| a.name == name);
+        assert!(attr.is_some(), "missing attribute {}", name);
+        let attr = attr.unwrap();
+        let val = i32::from_le_bytes(attr.raw_value[..4].try_into().unwrap());
+        assert_eq!(val, (i + 1) * 100);
+    }
+}
+
+// ── B-tree v2 chunk index ──
+
+#[test]
+fn read_btree_v2_chunked() {
+    let file = File::open(fixture("btree_v2_chunks.h5")).unwrap();
+    let root = file.root_group().unwrap();
+    let ds = root.dataset("bt2chunked").unwrap();
+
+    assert_eq!(ds.shape().unwrap(), vec![6, 4]);
+
+    let raw = ds.read_raw().unwrap();
+    assert_eq!(raw.len(), 96); // 24 * 4 bytes (i32)
+
+    let values: Vec<i32> = raw
+        .chunks_exact(4)
+        .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    let expected: Vec<i32> = (0..24).collect();
+    assert_eq!(values, expected);
+}
+
 // ── Attribute reading ──
 
 #[test]

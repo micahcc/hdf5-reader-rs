@@ -176,6 +176,426 @@ static void create_shuffle_deflate(const char *filename)
     printf("Created %s\n", filename);
 }
 
+/* Create a chunked file with layout v3 (B-tree v1 index).
+ * Uses V18 bounds so the layout message is version 3. */
+static void create_chunked_btree_v1(const char *filename)
+{
+    hid_t fapl = H5Pcreate(H5P_FILE_ACCESS);
+    /* V18 bounds → superblock v2, layout message v3, B-tree v1 chunk index */
+    H5Pset_libver_bounds(fapl, H5F_LIBVER_V18, H5F_LIBVER_V18);
+
+    hid_t file = H5Fcreate(filename, H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
+
+    /* 1D dataset: 12 int32 values, chunked with chunk size 4 → 3 chunks */
+    hsize_t dims[1] = {12};
+    hid_t space = H5Screate_simple(1, dims, NULL);
+
+    hid_t dcpl = H5Pcreate(H5P_DATASET_CREATE);
+    hsize_t chunk_dims[1] = {4};
+    H5Pset_chunk(dcpl, 1, chunk_dims);
+    H5Pset_deflate(dcpl, 4);
+
+    hid_t dset = H5Dcreate2(file, "chunked_v3", H5T_STD_I32LE, space,
+                             H5P_DEFAULT, dcpl, H5P_DEFAULT);
+    int32_t vals[12];
+    for (int i = 0; i < 12; i++) vals[i] = (i + 1) * 10;
+    H5Dwrite(dset, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, vals);
+
+    H5Dclose(dset);
+    H5Pclose(dcpl);
+    H5Sclose(space);
+    H5Fclose(file);
+    H5Pclose(fapl);
+    printf("Created %s\n", filename);
+}
+
+/* Create a chunked file with one unlimited dimension → extensible array index. */
+static void create_extensible_array(const char *filename)
+{
+    hid_t fapl = H5Pcreate(H5P_FILE_ACCESS);
+    /* V110 bounds → layout v4 → extensible array for 1 unlimited dim */
+    H5Pset_libver_bounds(fapl, H5F_LIBVER_V110, H5F_LIBVER_V110);
+
+    hid_t file = H5Fcreate(filename, H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
+
+    /* 1D dataset with unlimited max, current size 15, chunk size 5 → 3 chunks */
+    hsize_t dims[1] = {15};
+    hsize_t maxdims[1] = {H5S_UNLIMITED};
+    hid_t space = H5Screate_simple(1, dims, maxdims);
+
+    hid_t dcpl = H5Pcreate(H5P_DATASET_CREATE);
+    hsize_t chunk_dims[1] = {5};
+    H5Pset_chunk(dcpl, 1, chunk_dims);
+
+    hid_t dset = H5Dcreate2(file, "extarray", H5T_STD_I32LE, space,
+                             H5P_DEFAULT, dcpl, H5P_DEFAULT);
+    int32_t vals[15];
+    for (int i = 0; i < 15; i++) vals[i] = (i + 1) * 100;
+    H5Dwrite(dset, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, vals);
+
+    H5Dclose(dset);
+    H5Pclose(dcpl);
+    H5Sclose(space);
+    H5Fclose(file);
+    H5Pclose(fapl);
+    printf("Created %s\n", filename);
+}
+
+/* Create a chunked dataset with implicit index (no filters, early alloc, fixed max). */
+static void create_implicit_chunks(const char *filename)
+{
+    hid_t fapl = H5Pcreate(H5P_FILE_ACCESS);
+    H5Pset_libver_bounds(fapl, H5F_LIBVER_V110, H5F_LIBVER_V110);
+
+    hid_t file = H5Fcreate(filename, H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
+
+    hsize_t dims[1] = {8};
+    hid_t space = H5Screate_simple(1, dims, NULL);
+
+    hid_t dcpl = H5Pcreate(H5P_DATASET_CREATE);
+    hsize_t chunk_dims[1] = {4};
+    H5Pset_chunk(dcpl, 1, chunk_dims);
+    /* Early allocation + no filters → implicit chunk index */
+    H5Pset_alloc_time(dcpl, H5D_ALLOC_TIME_EARLY);
+
+    hid_t dset = H5Dcreate2(file, "implicit", H5T_IEEE_F64LE, space,
+                             H5P_DEFAULT, dcpl, H5P_DEFAULT);
+    double vals[8] = {1.1, 2.2, 3.3, 4.4, 5.5, 6.6, 7.7, 8.8};
+    H5Dwrite(dset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, vals);
+
+    H5Dclose(dset);
+    H5Pclose(dcpl);
+    H5Sclose(space);
+    H5Fclose(file);
+    H5Pclose(fapl);
+    printf("Created %s\n", filename);
+}
+
+/* Create a 2D chunked dataset where dims don't evenly divide by chunk size. */
+static void create_edge_chunks(const char *filename)
+{
+    hid_t fapl = H5Pcreate(H5P_FILE_ACCESS);
+    H5Pset_libver_bounds(fapl, H5F_LIBVER_V110, H5F_LIBVER_V110);
+
+    hid_t file = H5Fcreate(filename, H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
+
+    /* 7x5 dataset, chunked 4x3 → 2x2 grid with edge chunks */
+    hsize_t dims[2] = {7, 5};
+    hid_t space = H5Screate_simple(2, dims, NULL);
+
+    hid_t dcpl = H5Pcreate(H5P_DATASET_CREATE);
+    hsize_t chunk_dims[2] = {4, 3};
+    H5Pset_chunk(dcpl, 2, chunk_dims);
+
+    hid_t dset = H5Dcreate2(file, "edge", H5T_STD_I32LE, space,
+                             H5P_DEFAULT, dcpl, H5P_DEFAULT);
+
+    /* Fill with row-major sequential values: 0, 1, 2, ..., 34 */
+    int32_t vals[35];
+    for (int i = 0; i < 35; i++) vals[i] = i;
+    H5Dwrite(dset, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, vals);
+
+    H5Dclose(dset);
+    H5Pclose(dcpl);
+    H5Sclose(space);
+    H5Fclose(file);
+    H5Pclose(fapl);
+    printf("Created %s\n", filename);
+}
+
+/* Create a file with a compound datatype dataset. */
+static void create_compound(const char *filename)
+{
+    hid_t fapl = H5Pcreate(H5P_FILE_ACCESS);
+    H5Pset_libver_bounds(fapl, H5F_LIBVER_V110, H5F_LIBVER_V110);
+
+    hid_t file = H5Fcreate(filename, H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
+
+    /* Define compound type: { int32_t id; float x; float y; } = 12 bytes */
+    typedef struct {
+        int32_t id;
+        float x;
+        float y;
+    } Point;
+
+    hid_t point_type = H5Tcreate(H5T_COMPOUND, sizeof(Point));
+    H5Tinsert(point_type, "id", HOFFSET(Point, id), H5T_STD_I32LE);
+    H5Tinsert(point_type, "x", HOFFSET(Point, x), H5T_IEEE_F32LE);
+    H5Tinsert(point_type, "y", HOFFSET(Point, y), H5T_IEEE_F32LE);
+
+    hsize_t dims[1] = {3};
+    hid_t space = H5Screate_simple(1, dims, NULL);
+    hid_t dset = H5Dcreate2(file, "points", point_type, space,
+                             H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+
+    Point data[3] = {
+        {1, 1.0f, 2.0f},
+        {2, 3.0f, 4.0f},
+        {3, 5.0f, 6.0f},
+    };
+    H5Dwrite(dset, point_type, H5S_ALL, H5S_ALL, H5P_DEFAULT, data);
+
+    H5Dclose(dset);
+    H5Tclose(point_type);
+    H5Sclose(space);
+    H5Fclose(file);
+    H5Pclose(fapl);
+    printf("Created %s\n", filename);
+}
+
+/* Create a file with an enum datatype dataset. */
+static void create_enum(const char *filename)
+{
+    hid_t fapl = H5Pcreate(H5P_FILE_ACCESS);
+    H5Pset_libver_bounds(fapl, H5F_LIBVER_V110, H5F_LIBVER_V110);
+
+    hid_t file = H5Fcreate(filename, H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
+
+    /* Define enum type based on int8_t */
+    hid_t enum_type = H5Tenum_create(H5T_STD_I8LE);
+    int8_t val;
+    val = 0; H5Tenum_insert(enum_type, "RED", &val);
+    val = 1; H5Tenum_insert(enum_type, "GREEN", &val);
+    val = 2; H5Tenum_insert(enum_type, "BLUE", &val);
+
+    hsize_t dims[1] = {5};
+    hid_t space = H5Screate_simple(1, dims, NULL);
+    hid_t dset = H5Dcreate2(file, "colors", enum_type, space,
+                             H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+
+    int8_t data[5] = {0, 1, 2, 1, 0}; /* RED, GREEN, BLUE, GREEN, RED */
+    H5Dwrite(dset, enum_type, H5S_ALL, H5S_ALL, H5P_DEFAULT, data);
+
+    H5Dclose(dset);
+    H5Tclose(enum_type);
+    H5Sclose(space);
+    H5Fclose(file);
+    H5Pclose(fapl);
+    printf("Created %s\n", filename);
+}
+
+/* Create a file with an array datatype dataset. */
+static void create_array(const char *filename)
+{
+    hid_t fapl = H5Pcreate(H5P_FILE_ACCESS);
+    H5Pset_libver_bounds(fapl, H5F_LIBVER_V110, H5F_LIBVER_V110);
+
+    hid_t file = H5Fcreate(filename, H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
+
+    /* Array type: int32[3] — each element of the dataset is a 3-element array */
+    hsize_t array_dims[1] = {3};
+    hid_t array_type = H5Tarray_create2(H5T_STD_I32LE, 1, array_dims);
+
+    /* Dataset: 4 elements, each a 3-element array → 12 total int32 values */
+    hsize_t dims[1] = {4};
+    hid_t space = H5Screate_simple(1, dims, NULL);
+    hid_t dset = H5Dcreate2(file, "vectors", array_type, space,
+                             H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+
+    /* 4 vectors: [1,2,3], [4,5,6], [7,8,9], [10,11,12] */
+    int32_t data[12] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
+    H5Dwrite(dset, array_type, H5S_ALL, H5S_ALL, H5P_DEFAULT, data);
+
+    H5Dclose(dset);
+    H5Tclose(array_type);
+    H5Sclose(space);
+    H5Fclose(file);
+    H5Pclose(fapl);
+    printf("Created %s\n", filename);
+}
+
+/* Create a file with a Fletcher32 checksum filter. */
+static void create_fletcher32(const char *filename)
+{
+    hid_t fapl = H5Pcreate(H5P_FILE_ACCESS);
+    H5Pset_libver_bounds(fapl, H5F_LIBVER_V110, H5F_LIBVER_V110);
+
+    hid_t file = H5Fcreate(filename, H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
+
+    hsize_t dims[1] = {10};
+    hid_t space = H5Screate_simple(1, dims, NULL);
+
+    hid_t dcpl = H5Pcreate(H5P_DATASET_CREATE);
+    hsize_t chunk_dims[1] = {10};
+    H5Pset_chunk(dcpl, 1, chunk_dims);
+    H5Pset_fletcher32(dcpl);
+
+    hid_t dset = H5Dcreate2(file, "checksummed", H5T_STD_I32LE, space,
+                             H5P_DEFAULT, dcpl, H5P_DEFAULT);
+    int32_t vals[10];
+    for (int i = 0; i < 10; i++) vals[i] = (i + 1) * 100;
+    H5Dwrite(dset, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, vals);
+
+    H5Dclose(dset);
+    H5Pclose(dcpl);
+    H5Sclose(space);
+    H5Fclose(file);
+    H5Pclose(fapl);
+    printf("Created %s\n", filename);
+}
+
+/* Create a file with variable-length string dataset. */
+static void create_vlen_strings(const char *filename)
+{
+    hid_t fapl = H5Pcreate(H5P_FILE_ACCESS);
+    H5Pset_libver_bounds(fapl, H5F_LIBVER_V110, H5F_LIBVER_V110);
+
+    hid_t file = H5Fcreate(filename, H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
+
+    /* Variable-length string type */
+    hid_t str_type = H5Tcopy(H5T_C_S1);
+    H5Tset_size(str_type, H5T_VARIABLE);
+    H5Tset_cset(str_type, H5T_CSET_UTF8);
+
+    hsize_t dims[1] = {4};
+    hid_t space = H5Screate_simple(1, dims, NULL);
+    hid_t dset = H5Dcreate2(file, "names", str_type, space,
+                             H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+
+    const char *data[4] = {"hello", "world", "HDF5", "variable-length"};
+    H5Dwrite(dset, str_type, H5S_ALL, H5S_ALL, H5P_DEFAULT, data);
+
+    H5Dclose(dset);
+    H5Tclose(str_type);
+    H5Sclose(space);
+    H5Fclose(file);
+    H5Pclose(fapl);
+    printf("Created %s\n", filename);
+}
+
+/* Create a file with variable-length integer sequence dataset. */
+static void create_vlen_sequence(const char *filename)
+{
+    hid_t fapl = H5Pcreate(H5P_FILE_ACCESS);
+    H5Pset_libver_bounds(fapl, H5F_LIBVER_V110, H5F_LIBVER_V110);
+
+    hid_t file = H5Fcreate(filename, H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
+
+    /* Variable-length sequence of int32 */
+    hid_t vlen_type = H5Tvlen_create(H5T_STD_I32LE);
+
+    hsize_t dims[1] = {3};
+    hid_t space = H5Screate_simple(1, dims, NULL);
+    hid_t dset = H5Dcreate2(file, "sequences", vlen_type, space,
+                             H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+
+    /* Three sequences of different lengths */
+    int32_t seq0[] = {10, 20};
+    int32_t seq1[] = {100, 200, 300, 400};
+    int32_t seq2[] = {42};
+    hvl_t data[3];
+    data[0].len = 2; data[0].p = seq0;
+    data[1].len = 4; data[1].p = seq1;
+    data[2].len = 1; data[2].p = seq2;
+
+    H5Dwrite(dset, vlen_type, H5S_ALL, H5S_ALL, H5P_DEFAULT, data);
+
+    H5Dclose(dset);
+    H5Tclose(vlen_type);
+    H5Sclose(space);
+    H5Fclose(file);
+    H5Pclose(fapl);
+    printf("Created %s\n", filename);
+}
+
+/* Create a dataset with an explicit fill value. */
+static void create_fill_value(const char *filename)
+{
+    hid_t fapl = H5Pcreate(H5P_FILE_ACCESS);
+    H5Pset_libver_bounds(fapl, H5F_LIBVER_V110, H5F_LIBVER_V110);
+
+    hid_t file = H5Fcreate(filename, H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
+
+    hsize_t dims[1] = {6};
+    hid_t space = H5Screate_simple(1, dims, NULL);
+
+    hid_t dcpl = H5Pcreate(H5P_DATASET_CREATE);
+    int32_t fill = -999;
+    H5Pset_fill_value(dcpl, H5T_NATIVE_INT, &fill);
+
+    hid_t dset = H5Dcreate2(file, "filled", H5T_STD_I32LE, space,
+                             H5P_DEFAULT, dcpl, H5P_DEFAULT);
+
+    /* Write only first 4 elements; last 2 should get fill value if space allocated */
+    int32_t vals[6] = {10, 20, 30, 40, -999, -999};
+    H5Dwrite(dset, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, vals);
+
+    H5Dclose(dset);
+    H5Pclose(dcpl);
+    H5Sclose(space);
+    H5Fclose(file);
+    H5Pclose(fapl);
+    printf("Created %s\n", filename);
+}
+
+/* Create a dataset with dense attribute storage (many attributes). */
+static void create_dense_attributes(const char *filename)
+{
+    hid_t fapl = H5Pcreate(H5P_FILE_ACCESS);
+    H5Pset_libver_bounds(fapl, H5F_LIBVER_V110, H5F_LIBVER_V110);
+
+    hid_t file = H5Fcreate(filename, H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
+
+    /* Create a group creation property list that triggers dense storage early */
+    hid_t gcpl = H5Pcreate(H5P_GROUP_CREATE);
+    /* min_dense=3, max_compact=3: switch to dense after 3 attrs */
+    H5Pset_attr_phase_change(gcpl, 3, 3);
+
+    hid_t grp = H5Gcreate2(file, "densegroup", H5P_DEFAULT, gcpl, H5P_DEFAULT);
+
+    hid_t attr_space = H5Screate(H5S_SCALAR);
+    char attr_name[64];
+    for (int i = 0; i < 8; i++) {
+        snprintf(attr_name, sizeof(attr_name), "attr_%02d", i);
+        hid_t attr = H5Acreate2(grp, attr_name, H5T_STD_I32LE, attr_space,
+                                 H5P_DEFAULT, H5P_DEFAULT);
+        int32_t val = (i + 1) * 100;
+        H5Awrite(attr, H5T_NATIVE_INT, &val);
+        H5Aclose(attr);
+    }
+
+    H5Sclose(attr_space);
+    H5Gclose(grp);
+    H5Pclose(gcpl);
+    H5Fclose(file);
+    H5Pclose(fapl);
+    printf("Created %s\n", filename);
+}
+
+/* Create a chunked dataset with multiple unlimited dims → B-tree v2 chunk index. */
+static void create_btree_v2_chunks(const char *filename)
+{
+    hid_t fapl = H5Pcreate(H5P_FILE_ACCESS);
+    /* V110 bounds + multiple unlimited dims → B-tree v2 chunk index */
+    H5Pset_libver_bounds(fapl, H5F_LIBVER_V110, H5F_LIBVER_V110);
+
+    hid_t file = H5Fcreate(filename, H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
+
+    /* 2D dataset: 6x4, both dims unlimited, chunked 3x2 */
+    hsize_t dims[2] = {6, 4};
+    hsize_t maxdims[2] = {H5S_UNLIMITED, H5S_UNLIMITED};
+    hid_t space = H5Screate_simple(2, dims, maxdims);
+
+    hid_t dcpl = H5Pcreate(H5P_DATASET_CREATE);
+    hsize_t chunk_dims[2] = {3, 2};
+    H5Pset_chunk(dcpl, 2, chunk_dims);
+
+    hid_t dset = H5Dcreate2(file, "bt2chunked", H5T_STD_I32LE, space,
+                             H5P_DEFAULT, dcpl, H5P_DEFAULT);
+
+    /* Fill with row-major sequential values: 0..23 */
+    int32_t vals[24];
+    for (int i = 0; i < 24; i++) vals[i] = i;
+    H5Dwrite(dset, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, vals);
+
+    H5Dclose(dset);
+    H5Pclose(dcpl);
+    H5Sclose(space);
+    H5Fclose(file);
+    H5Pclose(fapl);
+    printf("Created %s\n", filename);
+}
+
 int main(void)
 {
     create_simple_contiguous("simple_contiguous_v2.h5");
@@ -183,5 +603,18 @@ int main(void)
     create_nested_groups("nested_groups_v2.h5");
     create_compact("compact_v2.h5");
     create_shuffle_deflate("shuffle_deflate_v3.h5");
+    create_chunked_btree_v1("chunked_btree_v1.h5");
+    create_extensible_array("extensible_array.h5");
+    create_implicit_chunks("implicit_chunks.h5");
+    create_edge_chunks("edge_chunks.h5");
+    create_compound("compound.h5");
+    create_enum("enum.h5");
+    create_array("array.h5");
+    create_fletcher32("fletcher32.h5");
+    create_vlen_strings("vlen_strings.h5");
+    create_vlen_sequence("vlen_sequence.h5");
+    create_fill_value("fill_value.h5");
+    create_dense_attributes("dense_attributes.h5");
+    create_btree_v2_chunks("btree_v2_chunks.h5");
     return 0;
 }

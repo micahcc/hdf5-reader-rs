@@ -48,6 +48,11 @@ Pure Rust HDF5 reader targeting superblock v2 and v3 files. WASM-compatible.
 - [ ] Huge object reading (B-tree v2 lookup)
 - [ ] Filtered direct block handling
 
+## Phase 4b: Global Heap
+- [x] Global heap collection parsing (magic `GCOL`)
+- [x] Object lookup by index
+- [x] Variable-length element resolution (heap ID → data)
+
 ## Phase 5: Datatype Decoding (full)
 - [x] Fixed-point (integer): byte order, sign, bit offset, precision
 - [x] Floating-point: byte order, mantissa/exponent layout, bias
@@ -56,21 +61,21 @@ Pure Rust HDF5 reader targeting superblock v2 and v3 files. WASM-compatible.
 - [x] Bitfield: byte order, bit offset, precision
 - [x] Reference: object / dataset region
 - [x] Time: bit precision
-- [ ] Compound: member names, offsets, types (recursive) — stubbed
-- [ ] Enumeration: base type, member names, values
-- [ ] Array: dimensions, element type
-- [ ] Variable-length: element type, padding, character set
+- [x] Compound: member names, offsets, types (recursive)
+- [x] Enumeration: base type, member names, values
+- [x] Array: dimensions, element type
+- [x] Variable-length: element type, padding, character set
 - [ ] Complex (HDF5 2.0): base floating-point type
 
 ## Phase 6: Data Reading
 - [x] Contiguous layout: read raw bytes from file offset
 - [x] Compact layout: read raw bytes from object header
-- [ ] Chunked layout with B-tree v1 index
+- [x] Chunked layout with B-tree v1 index (layout v3)
 - [ ] Chunked layout with B-tree v2 index
-- [ ] Chunked layout with extensible array index
-- [ ] Chunked layout with fixed array index
-- [ ] Single chunk optimization
-- [ ] Filter pipeline application on chunked read
+- [x] Chunked layout with extensible array index
+- [x] Chunked layout with fixed array index
+- [x] Single chunk optimization
+- [x] Filter pipeline application on chunked read
 - [ ] Hyperslab / partial reads
 - [ ] Type conversion on read (endian swap, widening)
 
@@ -93,6 +98,8 @@ Pure Rust HDF5 reader targeting superblock v2 and v3 files. WASM-compatible.
 - [x] `Dataset::read_raw()` — entire dataset as bytes (contiguous + compact)
 - [x] `Dataset::attributes()` / `Group::attributes()`
 - [x] `File::open_path("/group1/subgroup/dataset")`
+- [x] `Dataset::read_vlen()` — read variable-length dataset elements
+- [x] `Dataset::read_vlen_strings()` — read vlen strings as `Vec<String>`
 - [ ] `Dataset::read_slice()` — read hyperslab
 
 ## Phase 9: WASM & Portability
@@ -106,8 +113,10 @@ Pure Rust HDF5 reader targeting superblock v2 and v3 files. WASM-compatible.
 - [x] Fixture generator (C program using libhdf5)
 - [x] Fixture files: superblock v2 + v3, contiguous, compact, nested groups, attributes
 - [x] Integration tests: superblock, metadata, contiguous read, compact read, navigation, path lookup, attributes
-- [ ] Fixture files for chunked + compressed datasets
-- [ ] Fixture files for compound, enum, array, vlen types
+- [x] Fixture files for chunked + compressed datasets
+- [x] Fixture files for compound, enum, array types
+- [x] Fletcher32 checksum filter fixture + integration test
+- [x] Fixture files for vlen string + vlen sequence types
 - [ ] Large file (>4GB) fixture
 - [ ] SWMR file fixture (superblock v3 specific)
 - [ ] Fuzz testing on malformed inputs

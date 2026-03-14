@@ -47,19 +47,27 @@ pub enum DataLayout {
     },
     /// Chunked: data stored in fixed-size chunks, indexed.
     Chunked {
-        /// Number of dimensions (includes +1 for the "extra" dimension in v3).
+        /// Number of dimensions.
+        /// Both v3 and v4 store rank + 1, with the last dimension being
+        /// the element size in bytes.
         dimensionality: u8,
         /// Chunk dimensions (element counts per dimension).
         chunk_dims: Vec<u32>,
         /// For layout v3: address of the chunk B-tree v1.
-        /// For layout v4: depends on index type.
+        /// For layout v4: address of the chunk index structure.
         address: u64,
-        /// Layout message version.
+        /// Layout message version (3 or 4).
         layout_version: u8,
         /// Chunk index type (v4 only).
         chunk_index_type: Option<ChunkIndexType>,
-        /// Element size for data (v4 layout encodes this differently from v3).
-        encoded_data_size: Option<u32>,
+        /// Chunk flags byte (v4 only).
+        /// Bit 0: don't filter partial edge chunks.
+        /// Bit 1: single index with filter info present.
+        chunk_flags: u8,
+        /// For single-chunk with filter: the filtered (on-disk) size.
+        single_chunk_filtered_size: Option<u64>,
+        /// For single-chunk with filter: the filter mask.
+        single_chunk_filter_mask: Option<u32>,
     },
     /// Virtual: maps regions to other datasets (HDF5 1.10+).
     Virtual {
@@ -162,7 +170,9 @@ impl DataLayout {
                     address,
                     layout_version: 3,
                     chunk_index_type: None,
-                    encoded_data_size: None,
+                    chunk_flags: 0,
+                    single_chunk_filtered_size: None,
+                    single_chunk_filter_mask: None,
                 })
             }
             _ => Err(Error::InvalidLayout {
@@ -263,12 +273,24 @@ impl DataLayout {
                     }
                 };
 
-                // Skip index-type-specific creation parameters
+                // Parse index-type-specific creation parameters
+                let mut single_chunk_filtered_size = None;
+                let mut single_chunk_filter_mask = None;
+
                 match chunk_index_type {
                     ChunkIndexType::SingleChunk => {
-                        // If SINGLE_INDEX_WITH_FILTER flag set: sizeof_size + 4
                         if (flags & 0x02) != 0 {
-                            pos += l + 4; // filtered_size + filter_mask
+                            // SINGLE_INDEX_WITH_FILTER: filtered_size + filter_mask
+                            single_chunk_filtered_size =
+                                Some(read_var_uint(&data[pos..], l));
+                            pos += l;
+                            single_chunk_filter_mask = Some(u32::from_le_bytes([
+                                data[pos],
+                                data[pos + 1],
+                                data[pos + 2],
+                                data[pos + 3],
+                            ]));
+                            pos += 4;
                         }
                     }
                     ChunkIndexType::Implicit => {} // no params
@@ -296,7 +318,9 @@ impl DataLayout {
                     address,
                     layout_version: 4,
                     chunk_index_type: Some(chunk_index_type),
-                    encoded_data_size: None,
+                    chunk_flags: flags,
+                    single_chunk_filtered_size,
+                    single_chunk_filter_mask,
                 })
             }
             // Virtual

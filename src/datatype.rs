@@ -124,6 +124,12 @@ pub enum Datatype {
     /// Variable-length type.
     VarLen {
         element_type: Box<Datatype>,
+        /// True if this is a vlen string (class_bits type=1), false for sequence.
+        is_string: bool,
+        /// String padding (only for vlen strings).
+        padding: Option<StringPadding>,
+        /// Character set (only for vlen strings).
+        char_set: Option<CharacterSet>,
     },
     /// Opaque type.
     Opaque {
@@ -221,8 +227,11 @@ impl Datatype {
             DatatypeClass::FixedPoint => Self::parse_fixed_point(size, class_bits, props),
             DatatypeClass::FloatingPoint => Self::parse_floating_point(size, class_bits, props),
             DatatypeClass::String => Self::parse_string(size, class_bits),
-            DatatypeClass::Compound => Self::parse_compound(size, version, props),
-            DatatypeClass::Enum => Self::parse_enum(size, class_bits, props),
+            DatatypeClass::Compound => {
+                let nmembers = (class_bits & 0xFFFF) as usize;
+                Self::parse_compound(size, version, nmembers, props)
+            }
+            DatatypeClass::Enum => Self::parse_enum(size, version, class_bits, props),
             DatatypeClass::Array => Self::parse_array(version, props),
             DatatypeClass::VarLen => Self::parse_varlen(class_bits, props),
             DatatypeClass::Opaque => Self::parse_opaque(size, class_bits, props),
@@ -327,41 +336,342 @@ impl Datatype {
         })
     }
 
-    fn parse_compound(size: u32, version: u8, props: &[u8]) -> Result<Self> {
-        // Compound type version 3 (used with datatype message version 3):
-        //   Each member: name (null-terminated), byte offset (variable), datatype message
-        // The number of members is encoded in the class bits (bits 0-15 of the 24-bit field),
-        // but we received class_bits separately. For compound, the member count is
-        // the 16-bit value in class_bits[0..15].
-        // Actually, the member count is passed via the class_bits in the caller.
-        // Let's re-parse from the full data for correctness.
-        // For now, stub this out.
-        let _ = (version, props);
-        Ok(Datatype::Compound {
-            size,
-            members: Vec::new(), // TODO: parse members
+    fn parse_compound(size: u32, version: u8, nmembers: usize, props: &[u8]) -> Result<Self> {
+        // Compound type layout depends on version:
+        //   v1: name (null-term, padded to 8), byte_offset(4), dimensionality(1),
+        //       padding(3), dim_perm(4), padding(4), dim_sizes(4*4), datatype(8+)
+        //   v2: name (null-term, padded to 8), byte_offset(4), datatype(8+)
+        //   v3: name (null-term, NOT padded), byte_offset(1/2/4 based on type size),
+        //       datatype(8+)
+        let mut members = Vec::with_capacity(nmembers);
+        let mut pos = 0;
+
+        for _ in 0..nmembers {
+            if pos >= props.len() {
+                break;
+            }
+
+            // Read null-terminated name
+            let name_start = pos;
+            while pos < props.len() && props[pos] != 0 {
+                pos += 1;
+            }
+            let name = String::from_utf8_lossy(&props[name_start..pos]).to_string();
+            pos += 1; // skip null terminator
+
+            // V1 and v2 pad name to 8-byte boundary
+            if version < 3 {
+                pos = (pos + 7) & !7;
+            }
+
+            // Byte offset of this member within the compound type
+            let byte_offset = match version {
+                1 | 2 => {
+                    if pos + 4 > props.len() {
+                        return Err(Error::InvalidDatatype {
+                            msg: "compound member offset truncated".into(),
+                        });
+                    }
+                    let off = u32::from_le_bytes([
+                        props[pos],
+                        props[pos + 1],
+                        props[pos + 2],
+                        props[pos + 3],
+                    ]);
+                    pos += 4;
+                    off
+                }
+                3 => {
+                    // Offset width depends on total compound size
+                    let off_size = if size <= 0xFF {
+                        1
+                    } else if size <= 0xFFFF {
+                        2
+                    } else {
+                        4
+                    };
+                    if pos + off_size > props.len() {
+                        return Err(Error::InvalidDatatype {
+                            msg: "compound member offset truncated".into(),
+                        });
+                    }
+                    let off = match off_size {
+                        1 => props[pos] as u32,
+                        2 => u16::from_le_bytes([props[pos], props[pos + 1]]) as u32,
+                        _ => u32::from_le_bytes([
+                            props[pos],
+                            props[pos + 1],
+                            props[pos + 2],
+                            props[pos + 3],
+                        ]),
+                    };
+                    pos += off_size;
+                    off
+                }
+                _ => {
+                    return Err(Error::InvalidDatatype {
+                        msg: format!("unsupported compound datatype version {}", version),
+                    });
+                }
+            };
+
+            // V1 has extra fields: dimensionality(1) + padding(3) + dim_perm(4)
+            //                       + padding(4) + dim_sizes(4*4 = 16)
+            if version == 1 {
+                pos += 1 + 3 + 4 + 4 + 16; // 28 bytes of v1-specific fields
+            }
+
+            // Parse the member's datatype (recursive)
+            if pos + 8 > props.len() {
+                return Err(Error::InvalidDatatype {
+                    msg: "compound member datatype truncated".into(),
+                });
+            }
+            let member_dt = Datatype::parse(&props[pos..])?;
+            // The datatype message size: 8 (header) + properties
+            let dt_total_size = Self::encoded_size(&props[pos..])?;
+            pos += dt_total_size;
+
+            members.push(CompoundMember {
+                name,
+                byte_offset,
+                datatype: member_dt,
+            });
+        }
+
+        Ok(Datatype::Compound { size, members })
+    }
+
+    /// Compute the encoded size of a datatype message starting at `data`.
+    fn encoded_size(data: &[u8]) -> Result<usize> {
+        if data.len() < 8 {
+            return Err(Error::InvalidDatatype {
+                msg: "datatype too short to determine size".into(),
+            });
+        }
+        let class_and_version = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        let class_id = (class_and_version & 0x0F) as u8;
+        let version = ((class_and_version >> 4) & 0x0F) as u8;
+        let class_bits = class_and_version >> 8;
+        let size = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+
+        let props_size = match class_id {
+            0 => 4, // FixedPoint: bit_offset(2) + bit_precision(2)
+            1 => 12, // FloatingPoint
+            2 => 2, // Time
+            3 => 0, // String (all info in class_bits)
+            4 => 4, // BitField
+            5 => {
+                // Opaque: tag (class_bits & 0xFF) padded to 8
+                let tag_len = (class_bits & 0xFF) as usize;
+                (tag_len + 7) & !7
+            }
+            6 => {
+                // Compound: need to sum up all member sizes (recursive)
+                let nmembers = (class_bits & 0xFFFF) as usize;
+                let mut pos = 0;
+                let props = &data[8..];
+                for _ in 0..nmembers {
+                    // name
+                    while pos < props.len() && props[pos] != 0 {
+                        pos += 1;
+                    }
+                    pos += 1;
+                    if version < 3 {
+                        pos = (pos + 7) & !7;
+                    }
+                    // byte offset
+                    if version == 3 {
+                        let off_size = if size <= 0xFF {
+                            1
+                        } else if size <= 0xFFFF {
+                            2
+                        } else {
+                            4
+                        };
+                        pos += off_size;
+                    } else {
+                        pos += 4;
+                    }
+                    // v1 extra fields
+                    if version == 1 {
+                        pos += 28;
+                    }
+                    // recursive datatype
+                    if pos + 8 <= props.len() {
+                        let sub_size = Self::encoded_size(&props[pos..])?;
+                        pos += sub_size;
+                    }
+                }
+                pos
+            }
+            7 => 0, // Reference
+            8 => {
+                // Enum: base_type + nmembers * (name + value)
+                // This is complex; for now just return a safe overestimate
+                return Ok(data.len()); // consume remaining
+            }
+            10 => {
+                // Array: ndims + dim_sizes + element_type
+                // Complex; consume remaining
+                return Ok(data.len());
+            }
+            _ => 0,
+        };
+
+        Ok(8 + props_size)
+    }
+
+    fn parse_enum(_size: u32, version: u8, class_bits: u32, props: &[u8]) -> Result<Self> {
+        let nmembers = (class_bits & 0xFFFF) as usize;
+
+        // First: the base datatype message (at least 8 bytes)
+        if props.len() < 8 {
+            return Err(Error::InvalidDatatype {
+                msg: "enum base type truncated".into(),
+            });
+        }
+        let base = Box::new(Datatype::parse(props)?);
+        let base_size = Self::encoded_size(props)?;
+        let mut pos = base_size;
+
+        // Then: member names (null-terminated, padded to 8 in v1/v2, unpadded in v3)
+        let mut members = Vec::with_capacity(nmembers);
+        for _ in 0..nmembers {
+            let name_start = pos;
+            while pos < props.len() && props[pos] != 0 {
+                pos += 1;
+            }
+            let name = String::from_utf8_lossy(&props[name_start..pos]).to_string();
+            pos += 1; // skip null
+            if version < 3 {
+                pos = (pos + 7) & !7;
+            }
+            members.push(EnumMember {
+                name,
+                value: Vec::new(),
+            });
+        }
+
+        // Then: member values (each is base_type.element_size() bytes)
+        let val_size = base.element_size() as usize;
+        for member in &mut members {
+            if pos + val_size <= props.len() {
+                member.value = props[pos..pos + val_size].to_vec();
+                pos += val_size;
+            }
+        }
+
+        Ok(Datatype::Enum { base, members })
+    }
+
+    fn parse_array(version: u8, props: &[u8]) -> Result<Self> {
+        if props.len() < 1 {
+            return Err(Error::InvalidDatatype {
+                msg: "array properties too short".into(),
+            });
+        }
+
+        let ndims = props[0] as usize;
+        let mut pos = 1;
+
+        // Version 1 has 3 bytes of padding after ndims
+        if version < 2 {
+            pos += 3;
+        }
+
+        // Read dimension sizes (ndims * 4 bytes)
+        if pos + ndims * 4 > props.len() {
+            return Err(Error::InvalidDatatype {
+                msg: "array dimension sizes truncated".into(),
+            });
+        }
+        let mut dimensions = Vec::with_capacity(ndims);
+        for _ in 0..ndims {
+            let dim = u32::from_le_bytes([
+                props[pos],
+                props[pos + 1],
+                props[pos + 2],
+                props[pos + 3],
+            ]);
+            dimensions.push(dim);
+            pos += 4;
+        }
+
+        // Version 1 has ndims * 4 bytes of permutation indices (unused, must be zeros)
+        if version < 2 {
+            pos += ndims * 4;
+        }
+
+        // Parse the element type (recursive)
+        if pos + 8 > props.len() {
+            return Err(Error::InvalidDatatype {
+                msg: "array element type truncated".into(),
+            });
+        }
+        let element_type = Box::new(Datatype::parse(&props[pos..])?);
+
+        Ok(Datatype::Array {
+            element_type,
+            dimensions,
         })
     }
 
-    fn parse_enum(_size: u32, _class_bits: u32, _props: &[u8]) -> Result<Self> {
-        // TODO: parse base type + member names + values
-        Err(Error::InvalidDatatype {
-            msg: "enum datatype parsing not yet implemented".into(),
-        })
-    }
+    fn parse_varlen(class_bits: u32, props: &[u8]) -> Result<Self> {
+        // class_bits: bits 0-3 = type (0=sequence, 1=string)
+        //             bits 4-7 = padding type (for strings)
+        //             bits 8-11 = character set (for strings)
+        let vlen_type = class_bits & 0x0F;
 
-    fn parse_array(_version: u8, _props: &[u8]) -> Result<Self> {
-        // TODO: parse dimensions + element type
-        Err(Error::InvalidDatatype {
-            msg: "array datatype parsing not yet implemented".into(),
-        })
-    }
-
-    fn parse_varlen(_class_bits: u32, _props: &[u8]) -> Result<Self> {
-        // TODO: parse element type
-        Err(Error::InvalidDatatype {
-            msg: "varlen datatype parsing not yet implemented".into(),
-        })
+        if vlen_type == 1 {
+            // Variable-length string: element_type is the character type but
+            // we represent it as a VarLen with the string's charset info embedded.
+            let padding = match (class_bits >> 4) & 0x0F {
+                0 => StringPadding::NullTerminate,
+                1 => StringPadding::NullPad,
+                2 => StringPadding::SpacePad,
+                _ => StringPadding::NullTerminate,
+            };
+            let char_set = match (class_bits >> 8) & 0x0F {
+                0 => CharacterSet::Ascii,
+                1 => CharacterSet::Utf8,
+                _ => CharacterSet::Ascii,
+            };
+            // The base type in props describes the character type but for vlen strings
+            // we wrap it as String info
+            let element_type = if props.len() >= 8 {
+                Box::new(Datatype::parse(props)?)
+            } else {
+                // Fallback: assume u8 characters
+                Box::new(Datatype::FixedPoint {
+                    size: 1,
+                    byte_order: ByteOrder::LittleEndian,
+                    signed: false,
+                    bit_offset: 0,
+                    bit_precision: 8,
+                })
+            };
+            Ok(Datatype::VarLen {
+                element_type,
+                is_string: true,
+                padding: Some(padding),
+                char_set: Some(char_set),
+            })
+        } else {
+            // Variable-length sequence
+            if props.len() < 8 {
+                return Err(Error::InvalidDatatype {
+                    msg: "vlen element type truncated".into(),
+                });
+            }
+            let element_type = Box::new(Datatype::parse(props)?);
+            Ok(Datatype::VarLen {
+                element_type,
+                is_string: false,
+                padding: None,
+                char_set: None,
+            })
+        }
     }
 
     fn parse_opaque(size: u32, class_bits: u32, props: &[u8]) -> Result<Self> {
@@ -423,5 +733,318 @@ impl Datatype {
             size,
             bit_precision,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a raw datatype message from class, version, class_bits, size, and properties.
+    fn build_dt_msg(class: u8, version: u8, class_bits: u32, size: u32, props: &[u8]) -> Vec<u8> {
+        let cv = (class as u32) | ((version as u32) << 4) | (class_bits << 8);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&cv.to_le_bytes());
+        buf.extend_from_slice(&size.to_le_bytes());
+        buf.extend_from_slice(props);
+        buf
+    }
+
+    #[test]
+    fn parse_fixed_point_i32_le() {
+        // class=0 (FixedPoint), version=1, signed (bit 3 of class_bits), LE (bit 0 = 0)
+        let props = [0, 0, 32, 0]; // bit_offset=0, bit_precision=32
+        let msg = build_dt_msg(0, 1, 0x08, 4, &props); // 0x08 = signed
+        let dt = Datatype::parse(&msg).unwrap();
+        match dt {
+            Datatype::FixedPoint {
+                size,
+                byte_order,
+                signed,
+                bit_offset,
+                bit_precision,
+            } => {
+                assert_eq!(size, 4);
+                assert_eq!(byte_order, ByteOrder::LittleEndian);
+                assert!(signed);
+                assert_eq!(bit_offset, 0);
+                assert_eq!(bit_precision, 32);
+            }
+            other => panic!("expected FixedPoint, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_fixed_point_u8_be() {
+        // class=0, version=1, unsigned (no bit 3), BE (bit 0 = 1)
+        let props = [0, 0, 8, 0]; // bit_offset=0, bit_precision=8
+        let msg = build_dt_msg(0, 1, 0x01, 1, &props);
+        let dt = Datatype::parse(&msg).unwrap();
+        match dt {
+            Datatype::FixedPoint {
+                size,
+                byte_order,
+                signed,
+                ..
+            } => {
+                assert_eq!(size, 1);
+                assert_eq!(byte_order, ByteOrder::BigEndian);
+                assert!(!signed);
+            }
+            other => panic!("expected FixedPoint, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_float_f64_le() {
+        // class=1, version=1, LE (byte_order_lo=0, byte_order_hi=0)
+        let mut props = vec![0u8; 12];
+        props[2..4].copy_from_slice(&64u16.to_le_bytes()); // bit_precision=64
+        props[4] = 52; // exponent_location
+        props[5] = 11; // exponent_size
+        props[6] = 0; // mantissa_location
+        props[7] = 52; // mantissa_size
+        props[8..12].copy_from_slice(&1023u32.to_le_bytes()); // exponent_bias
+        let msg = build_dt_msg(1, 1, 0, 8, &props);
+        let dt = Datatype::parse(&msg).unwrap();
+        match dt {
+            Datatype::FloatingPoint {
+                size,
+                byte_order,
+                exponent_bias,
+                mantissa_size,
+                ..
+            } => {
+                assert_eq!(size, 8);
+                assert_eq!(byte_order, ByteOrder::LittleEndian);
+                assert_eq!(exponent_bias, 1023);
+                assert_eq!(mantissa_size, 52);
+            }
+            other => panic!("expected FloatingPoint, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_string_ascii_nullterm() {
+        // class=3, version=1, padding=NullTerminate(0), charset=Ascii(0)
+        let msg = build_dt_msg(3, 1, 0x00, 10, &[]);
+        let dt = Datatype::parse(&msg).unwrap();
+        match dt {
+            Datatype::String {
+                size,
+                padding,
+                char_set,
+            } => {
+                assert_eq!(size, 10);
+                assert_eq!(padding, StringPadding::NullTerminate);
+                assert_eq!(char_set, CharacterSet::Ascii);
+            }
+            other => panic!("expected String, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_string_utf8_nullpad() {
+        // padding=NullPad(1), charset=Utf8(1)
+        // class_bits = (charset << 4) | padding = 0x11
+        let msg = build_dt_msg(3, 1, 0x11, 32, &[]);
+        let dt = Datatype::parse(&msg).unwrap();
+        match dt {
+            Datatype::String {
+                padding,
+                char_set,
+                ..
+            } => {
+                assert_eq!(padding, StringPadding::NullPad);
+                assert_eq!(char_set, CharacterSet::Utf8);
+            }
+            other => panic!("expected String, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_compound_v3_two_members() {
+        // Compound v3: unpadded names, variable-width offsets
+        // Compound size=8 → offset width=1 byte
+        // Member 1: "a" at offset 0, type = u32 LE (FixedPoint, 4 bytes, class_bits=0x08)
+        // Member 2: "b" at offset 4, type = u32 LE
+        let mut props = Vec::new();
+        // Member "a": name "a\0", offset=0, then u32 LE datatype
+        props.extend_from_slice(b"a\0");
+        props.push(0); // offset = 0
+        props.extend_from_slice(&build_dt_msg(0, 3, 0x08, 4, &[0, 0, 32, 0]));
+        // Member "b": name "b\0", offset=4, then u32 LE datatype
+        props.extend_from_slice(b"b\0");
+        props.push(4); // offset = 4
+        props.extend_from_slice(&build_dt_msg(0, 3, 0x08, 4, &[0, 0, 32, 0]));
+
+        // class=6 (Compound), version=3, class_bits lower 16 = nmembers=2
+        let msg = build_dt_msg(6, 3, 2, 8, &props);
+        let dt = Datatype::parse(&msg).unwrap();
+        match dt {
+            Datatype::Compound { size, members } => {
+                assert_eq!(size, 8);
+                assert_eq!(members.len(), 2);
+                assert_eq!(members[0].name, "a");
+                assert_eq!(members[0].byte_offset, 0);
+                assert_eq!(members[1].name, "b");
+                assert_eq!(members[1].byte_offset, 4);
+            }
+            other => panic!("expected Compound, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_enum_v3_i8() {
+        // Enum v3: base type = i8 LE, 2 members
+        let mut props = Vec::new();
+        // Base type: i8 LE signed (class=0, version=3, class_bits=0x08, size=1)
+        props.extend_from_slice(&build_dt_msg(0, 3, 0x08, 1, &[0, 0, 8, 0]));
+        // V3 names: unpadded, null-terminated
+        props.extend_from_slice(b"OFF\0");
+        props.extend_from_slice(b"ON\0");
+        // Values: 0, 1
+        props.push(0);
+        props.push(1);
+
+        // class=8 (Enum), version=3, nmembers=2
+        let msg = build_dt_msg(8, 3, 2, 1, &props);
+        let dt = Datatype::parse(&msg).unwrap();
+        match dt {
+            Datatype::Enum { base, members } => {
+                assert_eq!(base.element_size(), 1);
+                assert_eq!(members.len(), 2);
+                assert_eq!(members[0].name, "OFF");
+                assert_eq!(members[0].value, vec![0]);
+                assert_eq!(members[1].name, "ON");
+                assert_eq!(members[1].value, vec![1]);
+            }
+            other => panic!("expected Enum, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_array_v2_1d() {
+        // Array v2: ndims=1, dim[0]=5, element type = f32 LE
+        let mut props = Vec::new();
+        props.push(1); // ndims
+        // v2: no padding after ndims
+        props.extend_from_slice(&5u32.to_le_bytes()); // dimension[0] = 5
+        // Element type: f32 LE
+        let mut f32_props = vec![0u8; 12];
+        f32_props[2..4].copy_from_slice(&32u16.to_le_bytes()); // bit_precision=32
+        f32_props[4] = 23; // exponent_location
+        f32_props[5] = 8; // exponent_size
+        f32_props[6] = 0; // mantissa_location
+        f32_props[7] = 23; // mantissa_size
+        f32_props[8..12].copy_from_slice(&127u32.to_le_bytes()); // exponent_bias
+        props.extend_from_slice(&build_dt_msg(1, 1, 0, 4, &f32_props));
+
+        // class=10 (Array), version=2, size doesn't matter (computed from dims * element)
+        let msg = build_dt_msg(10, 2, 0, 20, &props);
+        let dt = Datatype::parse(&msg).unwrap();
+        match dt {
+            Datatype::Array {
+                ref element_type,
+                ref dimensions,
+            } => {
+                assert_eq!(dimensions, &vec![5]);
+                assert_eq!(element_type.element_size(), 4);
+                assert_eq!(dt.element_size(), 20); // 5 * 4
+            }
+            other => panic!("expected Array, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_array_v1_with_padding() {
+        // Array v1: ndims=1, then 3 bytes padding, dim[0]=3, then 4 bytes perm, element type
+        let mut props = Vec::new();
+        props.push(1); // ndims
+        props.extend_from_slice(&[0, 0, 0]); // v1 padding
+        props.extend_from_slice(&3u32.to_le_bytes()); // dimension[0] = 3
+        props.extend_from_slice(&0u32.to_le_bytes()); // v1 permutation[0] = 0
+        // Element type: i16 LE signed
+        props.extend_from_slice(&build_dt_msg(0, 1, 0x08, 2, &[0, 0, 16, 0]));
+
+        let msg = build_dt_msg(10, 1, 0, 6, &props);
+        let dt = Datatype::parse(&msg).unwrap();
+        match dt {
+            Datatype::Array {
+                ref element_type,
+                ref dimensions,
+            } => {
+                assert_eq!(dimensions, &vec![3]);
+                assert_eq!(element_type.element_size(), 2);
+                assert_eq!(dt.element_size(), 6); // 3 * 2
+            }
+            other => panic!("expected Array, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_opaque() {
+        // class=5 (Opaque), tag_len in class_bits lower 8 = 4
+        let props = b"test\0\0\0\0"; // tag "test", padded to 8
+        let msg = build_dt_msg(5, 1, 4, 16, props);
+        let dt = Datatype::parse(&msg).unwrap();
+        match dt {
+            Datatype::Opaque { size, tag } => {
+                assert_eq!(size, 16);
+                assert_eq!(tag, "test");
+            }
+            other => panic!("expected Opaque, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn element_size_compound() {
+        let dt = Datatype::Compound {
+            size: 24,
+            members: vec![],
+        };
+        assert_eq!(dt.element_size(), 24);
+    }
+
+    #[test]
+    fn element_size_enum() {
+        let dt = Datatype::Enum {
+            base: Box::new(Datatype::FixedPoint {
+                size: 4,
+                byte_order: ByteOrder::LittleEndian,
+                signed: true,
+                bit_offset: 0,
+                bit_precision: 32,
+            }),
+            members: vec![],
+        };
+        assert_eq!(dt.element_size(), 4);
+    }
+
+    #[test]
+    fn element_size_array_2d() {
+        let dt = Datatype::Array {
+            element_type: Box::new(Datatype::FixedPoint {
+                size: 8,
+                byte_order: ByteOrder::LittleEndian,
+                signed: true,
+                bit_offset: 0,
+                bit_precision: 64,
+            }),
+            dimensions: vec![3, 4],
+        };
+        assert_eq!(dt.element_size(), 96); // 3 * 4 * 8
+    }
+
+    #[test]
+    fn reject_too_short_message() {
+        let data = [0u8; 4];
+        assert!(Datatype::parse(&data).is_err());
+    }
+
+    #[test]
+    fn reject_unknown_class() {
+        let msg = build_dt_msg(15, 1, 0, 4, &[]);
+        assert!(Datatype::parse(&msg).is_err());
     }
 }

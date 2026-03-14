@@ -470,3 +470,16 @@ pub fn parse_link_name_record(data: &[u8], heap_id_len: usize) -> Option<(u32, V
     let heap_id = data[4..4 + heap_id_len].to_vec();
     Some((hash, heap_id))
 }
+
+/// Parse a B-tree v2 "type 8" record (attribute name for dense attribute storage).
+///
+/// Layout: heap_id (heap_id_len bytes) + flags (1 byte) + creation_order (4 bytes) + hash (4 bytes).
+pub fn parse_attribute_name_record(data: &[u8], heap_id_len: usize) -> Option<Vec<u8>> {
+    if data.len() < heap_id_len + 1 + 4 + 4 {
+        return None;
+    }
+    let heap_id = data[..heap_id_len].to_vec();
+    // flags at heap_id_len, creation_order at heap_id_len+1, hash at heap_id_len+5
+    // We only need the heap_id to look up the attribute message
+    Some(heap_id)
+}

@@ -22,12 +22,14 @@
 
 pub mod btree2;
 pub mod checksum;
+pub mod chunk;
 pub mod dataspace;
 pub mod datatype;
 pub mod error;
 pub mod file;
 pub mod filters;
 pub mod fractal_heap;
+pub mod global_heap;
 pub mod io;
 pub mod layout;
 pub mod link;
@@ -36,7 +38,7 @@ pub mod superblock;
 
 // Re-export the main public types at crate root.
 pub use error::{Error, Result};
-pub use file::{Attribute, Dataset, File, Group, Node};
+pub use file::{Attribute, Dataset, File, FillValue, Group, Node};
 pub use dataspace::Dataspace;
 pub use datatype::Datatype;
 pub use io::ReadAt;

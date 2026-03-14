@@ -407,6 +407,19 @@ impl<'a, R: ReadAt + ?Sized> Dataset<'a, R> {
         Ok(None)
     }
 
+    /// The fill value for this dataset, if defined.
+    pub fn fill_value(&self) -> Result<FillValue> {
+        for msg in &self.header.messages {
+            if msg.msg_type == MessageType::FillValue {
+                return FillValue::parse(&msg.data);
+            }
+        }
+        Ok(FillValue {
+            defined: false,
+            value: None,
+        })
+    }
+
     /// Read all attributes on this dataset.
     pub fn attributes(&self) -> Result<Vec<Attribute>> {
         parse_attributes(&self.header, self.file)
@@ -448,19 +461,164 @@ impl<'a, R: ReadAt + ?Sized> Dataset<'a, R> {
                 }
             }
             DataLayout::Chunked { .. } => {
-                // TODO: implement chunked reading
-                //  1. Determine chunk index type
-                //  2. Look up all chunks via B-tree v1/v2 or other index
-                //  3. Read each chunk, apply filter pipeline
-                //  4. Assemble into contiguous output buffer
-                Err(Error::Other {
-                    msg: "chunked dataset reading not yet implemented".into(),
-                })
+                let dtype = self.datatype()?;
+                let dspace = self.dataspace()?;
+                let dataset_dims = dspace.shape();
+                let element_size = dtype.element_size();
+                let max_dims = dspace.max_dimensions();
+                crate::chunk::read_chunked(
+                    &*self.file.reader,
+                    &layout,
+                    dataset_dims,
+                    element_size,
+                    &filters,
+                    self.file.size_of_offsets(),
+                    self.file.size_of_lengths(),
+                    max_dims,
+                )
             }
             DataLayout::Virtual { .. } => Err(Error::Other {
                 msg: "virtual dataset reading not supported".into(),
             }),
         }
+    }
+
+    /// Read a variable-length dataset, resolving global heap references.
+    ///
+    /// Returns one `Vec<u8>` per element, containing the resolved vlen data.
+    /// For vlen strings, each entry is the raw string bytes (use
+    /// `read_vlen_strings()` for convenience).
+    pub fn read_vlen(&self) -> Result<Vec<Vec<u8>>> {
+        let raw = self.read_raw()?;
+        let dspace = self.dataspace()?;
+        let num_elements = dspace.num_elements() as usize;
+
+        crate::global_heap::resolve_vlen_elements(
+            &*self.file.reader,
+            &raw,
+            num_elements,
+            self.file.size_of_offsets(),
+            self.file.size_of_lengths(),
+        )
+    }
+
+    /// Read a variable-length string dataset, returning Rust strings.
+    ///
+    /// Each element is converted from raw bytes to a `String`, stripping
+    /// any null padding.
+    pub fn read_vlen_strings(&self) -> Result<Vec<String>> {
+        let vlen_data = self.read_vlen()?;
+        Ok(vlen_data
+            .into_iter()
+            .map(|bytes| {
+                String::from_utf8_lossy(&bytes)
+                    .trim_end_matches('\0')
+                    .to_string()
+            })
+            .collect())
+    }
+}
+
+/// A parsed fill value from a fill value message (type 0x0005).
+#[derive(Debug, Clone)]
+pub struct FillValue {
+    pub defined: bool,
+    pub value: Option<Vec<u8>>,
+}
+
+impl FillValue {
+    /// Parse a fill value message body.
+    pub fn parse(data: &[u8]) -> Result<Self> {
+        if data.is_empty() {
+            return Ok(FillValue {
+                defined: false,
+                value: None,
+            });
+        }
+        let version = data[0];
+        match version {
+            1 | 2 => Self::parse_v1v2(data, version),
+            3 => Self::parse_v3(data),
+            _ => Err(Error::InvalidObjectHeader {
+                msg: format!("unsupported fill value version {}", version),
+            }),
+        }
+    }
+
+    fn parse_v1v2(data: &[u8], version: u8) -> Result<Self> {
+        // v1/v2: version(1) + space_alloc_time(1) + fill_write_time(1) + fill_defined(1)
+        if data.len() < 4 {
+            return Ok(FillValue {
+                defined: false,
+                value: None,
+            });
+        }
+        let fill_defined = data[3];
+        // v2: fill_defined == 2 means user-defined value follows
+        // v1: value always follows (fill_defined field doesn't exist, size follows at byte 4)
+        if version == 2 && fill_defined != 2 {
+            return Ok(FillValue {
+                defined: fill_defined == 1,
+                value: None,
+            });
+        }
+        if data.len() < 8 {
+            return Ok(FillValue {
+                defined: fill_defined != 0,
+                value: None,
+            });
+        }
+        let size = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
+        if size == 0 || data.len() < 8 + size {
+            return Ok(FillValue {
+                defined: true,
+                value: None,
+            });
+        }
+        Ok(FillValue {
+            defined: true,
+            value: Some(data[8..8 + size].to_vec()),
+        })
+    }
+
+    fn parse_v3(data: &[u8]) -> Result<Self> {
+        // v3: version(1) + flags(1)
+        // flags bits 0-1: space alloc time
+        // flags bits 2-3: fill write time
+        // flags bit 4: fill value undefined
+        // flags bit 5: fill value defined
+        if data.len() < 2 {
+            return Ok(FillValue {
+                defined: false,
+                value: None,
+            });
+        }
+        let flags = data[1];
+        let undefined = (flags & 0x10) != 0;
+        let defined = (flags & 0x20) != 0;
+        if undefined || !defined {
+            return Ok(FillValue {
+                defined: false,
+                value: None,
+            });
+        }
+        if data.len() < 6 {
+            return Ok(FillValue {
+                defined: true,
+                value: None,
+            });
+        }
+        let size = u32::from_le_bytes([data[2], data[3], data[4], data[5]]) as usize;
+        if size == 0 || data.len() < 6 + size {
+            return Ok(FillValue {
+                defined: true,
+                value: None,
+            });
+        }
+        Ok(FillValue {
+            defined: true,
+            value: Some(data[6..6 + size].to_vec()),
+        })
     }
 }
 
@@ -476,7 +634,7 @@ pub struct Attribute {
 /// Parse attribute messages from an object header.
 fn parse_attributes<R: ReadAt + ?Sized>(
     header: &ObjectHeader,
-    _file: &File<R>,
+    file: &File<R>,
 ) -> Result<Vec<Attribute>> {
     let mut attrs = Vec::new();
 
@@ -488,7 +646,97 @@ fn parse_attributes<R: ReadAt + ?Sized>(
         }
     }
 
-    // TODO: also handle AttributeInfo message → fractal heap for dense attribute storage
+    if !attrs.is_empty() {
+        return Ok(attrs);
+    }
+
+    // Look for AttributeInfo message → dense attribute storage via fractal heap + B-tree v2
+    for msg in &header.messages {
+        if msg.msg_type == MessageType::AttributeInfo {
+            return parse_dense_attributes(&msg.data, file);
+        }
+    }
+
+    Ok(attrs)
+}
+
+/// Parse an Attribute Info message and read attributes from fractal heap + B-tree v2.
+///
+/// Attribute Info message layout:
+/// ```text
+/// Byte 0:    Version (0)
+/// Byte 1:    Flags (bit 0: max creation order present, bit 1: creation order index present)
+/// [if bit 0]: Max creation order (2 bytes)
+/// Fractal heap address (size_of_offsets)
+/// Attribute Name B-tree v2 address (size_of_offsets)
+/// [if bit 1]: Creation Order B-tree v2 address (size_of_offsets)
+/// ```
+fn parse_dense_attributes<R: ReadAt + ?Sized>(
+    data: &[u8],
+    file: &File<R>,
+) -> Result<Vec<Attribute>> {
+    let so = file.size_of_offsets();
+    let sl = file.size_of_lengths();
+    let o = so as usize;
+
+    if data.len() < 2 {
+        return Err(Error::InvalidObjectHeader {
+            msg: "attribute info message too short".into(),
+        });
+    }
+
+    let _version = data[0];
+    let flags = data[1];
+    let mut pos = 2;
+
+    // Optional max creation order
+    if (flags & 0x01) != 0 {
+        pos += 2;
+    }
+
+    if pos + o > data.len() {
+        return Err(Error::InvalidObjectHeader {
+            msg: "attribute info: truncated at fractal heap address".into(),
+        });
+    }
+    let fheap_addr = read_offset_from_slice(data, pos, so);
+    pos += o;
+
+    if pos + o > data.len() {
+        return Err(Error::InvalidObjectHeader {
+            msg: "attribute info: truncated at B-tree address".into(),
+        });
+    }
+    let bt2_name_addr = read_offset_from_slice(data, pos, so);
+
+    if fheap_addr == u64::MAX || bt2_name_addr == u64::MAX {
+        return Ok(Vec::new());
+    }
+
+    // Parse the fractal heap
+    let fheap = FractalHeapHeader::parse(&*file.reader, fheap_addr, so, sl)?;
+
+    // Parse the B-tree v2 (type 8: attribute name index)
+    let bt2 = BTree2Header::parse(&*file.reader, bt2_name_addr, so, sl)?;
+
+    let mut attrs = Vec::new();
+    let heap_id_len = fheap.heap_id_length as usize;
+
+    btree2::iterate_records(&*file.reader, &bt2, so, |record| {
+        if let Some(heap_id) = btree2::parse_attribute_name_record(&record.data, heap_id_len) {
+            let attr_data = fractal_heap::read_managed_object(
+                &*file.reader,
+                &fheap,
+                &heap_id,
+                so,
+                sl,
+            )?;
+            if let Ok(attr) = parse_attribute_message(&attr_data) {
+                attrs.push(attr);
+            }
+        }
+        Ok(())
+    })?;
 
     Ok(attrs)
 }

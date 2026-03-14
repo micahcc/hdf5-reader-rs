@@ -54,6 +54,17 @@ impl Dataspace {
         }
     }
 
+    /// The maximum dimensions, if present.
+    pub fn max_dimensions(&self) -> Option<&[u64]> {
+        match self {
+            Dataspace::Simple {
+                max_dimensions: Some(md),
+                ..
+            } => Some(md),
+            _ => None,
+        }
+    }
+
     /// Parse a dataspace message from raw bytes (the message body, not including
     /// the object header message prefix).
     pub fn parse(data: &[u8]) -> Result<Self> {
