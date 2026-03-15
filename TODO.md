@@ -106,6 +106,37 @@ Pure Rust HDF5 reader targeting superblock v2 and v3 files. WASM-compatible.
 - [x] Shared datatypes/dataspaces in attributes (attribute flags bits 0/1)
 - [x] Empty/unallocated chunked datasets (return zeros when address is UNDEF)
 
+## Phase 8b: Bug Fixes (audit against C library)
+
+Sources in
+```
+~/sources/hdf5
+```
+
+### Critical — B-tree v2
+- [x] Internal node layout: records and children are NOT interleaved; all records come first, then all child pointers (H5B2cache.c:655-682)
+- [x] Internal node `total_rec_bytes`: must use structural `cum_max_nrec_size` from node_info array, not `bytes_needed(total_records)`
+- [x] Type 10/11 chunk records: scaled offsets are fixed 8-byte UINT64DECODE per dimension, not variable-width (H5Dbtree2.c:410-429)
+- [x] `chunk_size_len` formula: C uses `1 + ((log2(chunk_size) + 8) / 8)` capped at 8, not `bytes_needed_for(size)` (H5Dbtree2.c:48-62)
+
+### Critical — Fractal heap
+- [ ] `max_direct_rows` off by one: C uses `(max_direct_bits - start_bits) + 2`, we use `+ 1` (H5HFdtable.c:94)
+- [ ] `block_size_for_row` must NOT cap at `max_direct_block_size` — indirect rows continue doubling (H5HFdtable.c:110-119)
+- [ ] Child indirect block `nrows`: C uses `(log2(row_block_size[row]) - first_row_bits) + 1` (H5HFdtable.c:237-251)
+
+### High — Object header / global heap
+- [ ] Nil message (type 0) should be skipped with its size field, not break the message loop (object_header/mod.rs:208-215)
+- [ ] Global heap free-space entry (index 0) should skip over its data, not break the object loop (global_heap.rs:82-85)
+
+### High — Datatype parsing
+- [ ] Compound v1/v2 name padding: should pad name length to 8-byte multiple from name start, not align absolute position (datatype.rs:376)
+- [ ] Compound v3 offset width: missing 3-byte case for sizes 65536–16777215 (datatype.rs:398-404)
+- [ ] `encoded_size` for VarLen/Enum/Array returns wrong values — affects compound types containing these
+
+### Medium
+- [ ] Fractal heap huge object `directly_accessed` flag may read wrong bit
+- [ ] VAX byte order mapping may be inverted for floating-point types
+
 ## Phase 9: WASM & Portability
 - [x] `ReadAt` impl for `&[u8]` / `Vec<u8>` (in-memory buffer)
 - [x] `ReadAt` impl for `std::fs::File` (native)

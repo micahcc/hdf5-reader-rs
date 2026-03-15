@@ -172,6 +172,60 @@ pub struct Record {
     pub data: Vec<u8>,
 }
 
+/// Per-depth-level node capacity information, matching H5B2_node_info_t in the C library.
+struct NodeInfo {
+    /// Maximum records in a node at this depth level.
+    max_nrec: usize,
+    /// Maximum total records in a subtree rooted at this depth level.
+    cum_max_nrec: u64,
+    /// Bytes needed to encode cum_max_nrec (0 for leaf level).
+    cum_max_nrec_size: usize,
+}
+
+/// Compute the node_info array for all depth levels, plus the global max_nrec_size.
+///
+/// Matches H5B2_hdr_init() in H5B2hdr.c.
+fn compute_node_info(
+    node_size: u32,
+    record_size: u16,
+    sizeof_addr: u8,
+    depth: u16,
+) -> (usize, Vec<NodeInfo>) {
+    let mut info = Vec::with_capacity(depth as usize + 1);
+
+    // Level 0: leaf nodes
+    // max_nrec = (node_size - H5B2_METADATA_PREFIX_SIZE) / record_size
+    // H5B2_METADATA_PREFIX_SIZE = signature(4) + version(1) + type(1) + checksum(4) = 10
+    let leaf_max_nrec = (node_size as usize - 10) / record_size as usize;
+    info.push(NodeInfo {
+        max_nrec: leaf_max_nrec,
+        cum_max_nrec: leaf_max_nrec as u64,
+        cum_max_nrec_size: 0,
+    });
+
+    // max_nrec_size: bytes to encode the max record count in any node (leaf has the most)
+    let max_nrec_size = limit_enc_size(leaf_max_nrec as u64);
+
+    // Levels 1..=depth: internal nodes
+    for u in 1..=depth as usize {
+        let ptr_size = sizeof_addr as usize + max_nrec_size + info[u - 1].cum_max_nrec_size;
+        // max_nrec[u] = (node_size - 10 - ptr_size) / (record_size + ptr_size)
+        // The extra ptr_size in the numerator accounts for the (n+1)th child pointer.
+        let int_max_nrec =
+            (node_size as usize - 10 - ptr_size) / (record_size as usize + ptr_size);
+        let cum =
+            (int_max_nrec as u64 + 1) * info[u - 1].cum_max_nrec + int_max_nrec as u64;
+        let cum_size = limit_enc_size(cum);
+        info.push(NodeInfo {
+            max_nrec: int_max_nrec,
+            cum_max_nrec: cum,
+            cum_max_nrec_size: cum_size,
+        });
+    }
+
+    (max_nrec_size, info)
+}
+
 /// Iterate all records in a B-tree v2 by walking from the root.
 ///
 /// Calls `callback` for each record found in leaf-order (sorted).
@@ -189,6 +243,9 @@ where
         return Ok(());
     }
 
+    let (max_nrec_size, node_info) =
+        compute_node_info(header.node_size, header.record_size, size_of_offsets, header.depth);
+
     iterate_node(
         reader,
         header,
@@ -196,6 +253,8 @@ where
         header.root_num_records,
         header.depth,
         size_of_offsets,
+        max_nrec_size,
+        &node_info,
         &mut callback,
     )
 }
@@ -207,6 +266,8 @@ fn iterate_node<R, F>(
     num_records: u16,
     depth: u16,
     size_of_offsets: u8,
+    max_nrec_size: usize,
+    node_info: &[NodeInfo],
     callback: &mut F,
 ) -> Result<()>
 where
@@ -214,11 +275,19 @@ where
     F: FnMut(&Record) -> Result<()>,
 {
     if depth == 0 {
-        // Leaf node
         iterate_leaf(reader, header, addr, num_records, callback)
     } else {
-        // Internal node
-        iterate_internal(reader, header, addr, num_records, depth, size_of_offsets, callback)
+        iterate_internal(
+            reader,
+            header,
+            addr,
+            num_records,
+            depth,
+            size_of_offsets,
+            max_nrec_size,
+            node_info,
+            callback,
+        )
     }
 }
 
@@ -285,24 +354,26 @@ fn iterate_internal<R, F>(
     num_records: u16,
     depth: u16,
     size_of_offsets: u8,
+    max_nrec_size: usize,
+    node_info: &[NodeInfo],
     callback: &mut F,
 ) -> Result<()>
 where
     R: ReadAt + ?Sized,
     F: FnMut(&Record) -> Result<()>,
 {
-    // Internal node layout:
+    // Internal node on-disk layout (H5B2cache.c):
     //   Signature "BTIN" (4)
     //   Version (1)
     //   Type (1)
-    //   Records and child pointers interleaved:
-    //     child_ptr[0] (size_of_offsets), num_records_child[0] (variable), total_records_child[0] (variable)
-    //     record[0] (record_size)
-    //     child_ptr[1], num_records_child[1], total_records_child[1]
-    //     record[1]
-    //     ...
-    //     child_ptr[num_records] (one more child than records)
+    //   Records[0..nrec-1]  (nrec * record_size)          — all records first
+    //   ChildPtrs[0..nrec]  ((nrec+1) * child_entry_size) — then all child pointers
     //   Checksum (4)
+    //
+    // Each child pointer entry:
+    //   address        (size_of_offsets bytes)
+    //   node_nrec      (max_nrec_size bytes)
+    //   all_nrec       (cum_max_nrec_size bytes, only when depth > 1)
     let mut magic = [0u8; 4];
     reader.read_exact_at(addr, &mut magic).map_err(Error::Io)?;
     if magic != BTIN_MAGIC {
@@ -311,37 +382,18 @@ where
         });
     }
 
-    // Determine the size of the child pointer entries.
-    // Each child entry: address (size_of_offsets) + num_records (variable) + total_records (variable if depth > 1)
-    // The num_records field size depends on the max possible records per node.
-    // For simplicity, we compute it from the node size and record size.
-    // Max records in a node: (node_size - overhead) / record_size
-    // The num_records field is stored in the minimum bytes needed to represent the max count.
-    let max_records_leaf = (header.node_size as usize - 10) / header.record_size as usize;
-    let max_records_internal = max_records_leaf; // approximation; internal nodes have different overhead
-    let num_rec_bytes = bytes_needed(max_records_internal as u64);
-    // total_records is only present when depth > 1
-    let total_rec_bytes = if depth > 1 {
-        // Need to represent total records in the subtree — use size_of_lengths or
-        // compute from total. For simplicity use the same encoding as num_records
-        // for the maximum possible. This is an approximation.
-        // Actually the HDF5 spec says this field uses the minimum bytes needed
-        // to represent the maximum possible total records in the subtree.
-        // For now, use a generous estimate.
-        bytes_needed(header.total_records)
-    } else {
-        0
-    };
-
     let o = size_of_offsets as usize;
-    let child_entry_size = o + num_rec_bytes + total_rec_bytes;
     let rec_size = header.record_size as usize;
-
-    // Compute actual content size: header(6) + interleaved children/records
     let n = num_records as usize;
-    let content_len = 6 + (n + 1) * child_entry_size + n * rec_size;
 
-    // Read node data and verify checksum (checksum follows content immediately)
+    // Child pointer entry size: addr + nrec + all_nrec (all_nrec only at depth > 1)
+    let cum_size = node_info[depth as usize - 1].cum_max_nrec_size;
+    let child_entry_size = o + max_nrec_size + cum_size;
+
+    // Content = header(6) + all records + all child pointers
+    let content_len = 6 + n * rec_size + (n + 1) * child_entry_size;
+
+    // Read node data and verify checksum
     let read_len = content_len + 4;
     let mut node_data = vec![0u8; read_len];
     reader
@@ -361,27 +413,25 @@ where
         });
     }
 
-    // Parse interleaved children and records
-    let mut pos = 6usize; // after magic + version + type
-    let mut children: Vec<(u64, u16)> = Vec::with_capacity(n + 1); // (addr, num_records)
+    // Parse all records (contiguous block starting at offset 6)
+    let mut pos = 6usize;
     let mut records: Vec<Record> = Vec::with_capacity(n);
-
-    for i in 0..=n {
-        // Read child pointer
-        let child_addr = read_offset_from_slice(&node_data, pos, size_of_offsets);
-        let child_nrec = read_var_uint(&node_data, pos + o, num_rec_bytes) as u16;
-        children.push((child_addr, child_nrec));
-        pos += child_entry_size;
-
-        // Read record (except after the last child)
-        if i < n {
-            let rec_data = node_data[pos..pos + rec_size].to_vec();
-            records.push(Record { data: rec_data });
-            pos += rec_size;
-        }
+    for _ in 0..n {
+        let rec_data = node_data[pos..pos + rec_size].to_vec();
+        records.push(Record { data: rec_data });
+        pos += rec_size;
     }
 
-    // Recursively iterate: child[0], record[0], child[1], record[1], ... child[n]
+    // Parse all child pointers (contiguous block after records)
+    let mut children: Vec<(u64, u16)> = Vec::with_capacity(n + 1);
+    for _ in 0..=n {
+        let child_addr = read_offset_from_slice(&node_data, pos, size_of_offsets);
+        let child_nrec = read_var_uint(&node_data, pos + o, max_nrec_size) as u16;
+        children.push((child_addr, child_nrec));
+        pos += child_entry_size;
+    }
+
+    // Recursively iterate in sorted order: child[0], record[0], child[1], ..., child[n]
     for i in 0..=n {
         let (child_addr, child_nrec) = children[i];
         iterate_node(
@@ -391,6 +441,8 @@ where
             child_nrec,
             depth - 1,
             size_of_offsets,
+            max_nrec_size,
+            node_info,
             callback,
         )?;
         if i < n {
@@ -401,17 +453,16 @@ where
     Ok(())
 }
 
-/// Minimum bytes needed to represent value `v` (1, 2, 4, or 8).
-fn bytes_needed(v: u64) -> usize {
-    if v <= 0xFF {
-        1
-    } else if v <= 0xFFFF {
-        2
-    } else if v <= 0xFFFF_FFFF {
-        4
-    } else {
-        8
+/// Minimum bytes needed to encode value `v`, matching H5VM_limit_enc_size.
+///
+/// Returns floor(log2(v)) / 8 + 1 for v > 0, or 1 for v == 0.
+/// Unlike a power-of-two rounding, this gives continuous values: 1, 2, 3, 4, ...
+fn limit_enc_size(v: u64) -> usize {
+    if v == 0 {
+        return 1;
     }
+    let log2 = 63 - v.leading_zeros() as usize;
+    (log2 / 8) + 1
 }
 
 fn read_offset_from_slice(data: &[u8], offset: usize, size: u8) -> u64 {
@@ -437,27 +488,11 @@ fn read_offset_from_slice(data: &[u8], offset: usize, size: u8) -> u64 {
 }
 
 fn read_var_uint(data: &[u8], offset: usize, size: usize) -> u64 {
-    match size {
-        1 => data[offset] as u64,
-        2 => u16::from_le_bytes([data[offset], data[offset + 1]]) as u64,
-        4 => u32::from_le_bytes([
-            data[offset],
-            data[offset + 1],
-            data[offset + 2],
-            data[offset + 3],
-        ]) as u64,
-        8 => u64::from_le_bytes([
-            data[offset],
-            data[offset + 1],
-            data[offset + 2],
-            data[offset + 3],
-            data[offset + 4],
-            data[offset + 5],
-            data[offset + 6],
-            data[offset + 7],
-        ]),
-        _ => 0,
+    let mut result = 0u64;
+    for i in 0..size.min(8) {
+        result |= (data[offset + i] as u64) << (i * 8);
     }
+    result
 }
 
 /// Parse a B-tree v2 "type 5" record (link name for new-style groups).
@@ -485,6 +520,44 @@ pub fn parse_link_creation_order_record(data: &[u8], heap_id_len: usize) -> Opti
     ]);
     let heap_id = data[8..8 + heap_id_len].to_vec();
     Some((creation_order, heap_id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_limit_enc_size() {
+        assert_eq!(limit_enc_size(0), 1);
+        assert_eq!(limit_enc_size(1), 1);
+        assert_eq!(limit_enc_size(255), 1);
+        assert_eq!(limit_enc_size(256), 2);
+        assert_eq!(limit_enc_size(65535), 2);
+        assert_eq!(limit_enc_size(65536), 3);
+        assert_eq!(limit_enc_size((1 << 24) - 1), 3);
+        assert_eq!(limit_enc_size(1 << 24), 4);
+    }
+
+    #[test]
+    fn test_compute_node_info() {
+        // node_size=4096, record_size=24 (non-filtered 2D BT2 chunk record),
+        // sizeof_addr=8, depth=1
+        let (max_nrec_size, info) = compute_node_info(4096, 24, 8, 1);
+
+        // Leaf: max_nrec = (4096 - 10) / 24 = 170
+        assert_eq!(info[0].max_nrec, 170);
+        assert_eq!(info[0].cum_max_nrec, 170);
+        assert_eq!(info[0].cum_max_nrec_size, 0);
+
+        // max_nrec_size = limit_enc_size(170) = 1
+        assert_eq!(max_nrec_size, 1);
+
+        // Internal (depth=1): ptr_size = 8 + 1 + 0 = 9
+        // max_nrec = (4096 - 10 - 9) / (24 + 9) = 4077 / 33 = 123
+        assert_eq!(info[1].max_nrec, 123);
+        // cum_max_nrec = (123 + 1) * 170 + 123 = 21203
+        assert_eq!(info[1].cum_max_nrec, 21203);
+    }
 }
 
 /// Parse a B-tree v2 "type 8" record (attribute name for dense attribute storage).

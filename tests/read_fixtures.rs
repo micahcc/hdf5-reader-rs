@@ -1004,3 +1004,45 @@ fn read_filtered_fheap_attributes() {
     assert_eq!(v1, 42);
     assert_eq!(v2, 99);
 }
+
+// ── B-tree v2 deep (depth > 0) ──
+
+#[test]
+fn read_btree_v2_deep() {
+    let file = File::open(fixture("btree_v2_deep.h5")).unwrap();
+    let root = file.root_group().unwrap();
+    let ds = root.dataset("deep").unwrap();
+
+    assert_eq!(ds.shape().unwrap(), vec![20, 10]);
+
+    let raw = ds.read_raw().unwrap();
+    assert_eq!(raw.len(), 800); // 200 * 4 bytes (i32)
+
+    let values: Vec<i32> = raw
+        .chunks_exact(4)
+        .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    let expected: Vec<i32> = (0..200).collect();
+    assert_eq!(values, expected);
+}
+
+// ── B-tree v2 filtered chunks ──
+
+#[test]
+fn read_btree_v2_filtered() {
+    let file = File::open(fixture("btree_v2_filtered.h5")).unwrap();
+    let root = file.root_group().unwrap();
+    let ds = root.dataset("filtered").unwrap();
+
+    assert_eq!(ds.shape().unwrap(), vec![6, 4]);
+
+    let raw = ds.read_raw().unwrap();
+    assert_eq!(raw.len(), 96); // 24 * 4 bytes (i32)
+
+    let values: Vec<i32> = raw
+        .chunks_exact(4)
+        .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    let expected: Vec<i32> = (0..24).collect();
+    assert_eq!(values, expected);
+}

@@ -995,6 +995,76 @@ static void create_filtered_fheap(const char *filename)
     printf("Created %s\n", filename);
 }
 
+/* Create a B-tree v2 chunked dataset with enough chunks to force depth > 0.
+ * 2D dataset, both dims unlimited → B-tree v2.
+ * Shape 20x10, chunk 1x1 → 200 chunks.
+ * record_size = 8(addr) + 2*8(scaled) = 24
+ * max_leaf_records = (4096 - 10) / 24 = 170, so 200 chunks → depth=1 */
+static void create_btree_v2_deep(const char *filename)
+{
+    hid_t fapl = H5Pcreate(H5P_FILE_ACCESS);
+    H5Pset_libver_bounds(fapl, H5F_LIBVER_V110, H5F_LIBVER_V110);
+
+    hid_t file = H5Fcreate(filename, H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
+
+    hsize_t dims[2] = {20, 10};
+    hsize_t maxdims[2] = {H5S_UNLIMITED, H5S_UNLIMITED};
+    hid_t space = H5Screate_simple(2, dims, maxdims);
+
+    hid_t dcpl = H5Pcreate(H5P_DATASET_CREATE);
+    hsize_t chunk_dims[2] = {1, 1};
+    H5Pset_chunk(dcpl, 2, chunk_dims);
+
+    hid_t dset = H5Dcreate2(file, "deep", H5T_STD_I32LE, space,
+                             H5P_DEFAULT, dcpl, H5P_DEFAULT);
+
+    int32_t vals[200];
+    for (int i = 0; i < 200; i++) vals[i] = i;
+    H5Dwrite(dset, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, vals);
+
+    H5Dclose(dset);
+    H5Pclose(dcpl);
+    H5Sclose(space);
+    H5Fclose(file);
+    H5Pclose(fapl);
+    printf("Created %s\n", filename);
+}
+
+/* Create a B-tree v2 chunked dataset with deflate filter.
+ * 2D dataset, both dims unlimited → B-tree v2.
+ * Shape 6x4, chunk 3x2 → 4 chunks. Exercises filtered record field order
+ * and chunk_size_len formula. */
+static void create_btree_v2_filtered(const char *filename)
+{
+    hid_t fapl = H5Pcreate(H5P_FILE_ACCESS);
+    H5Pset_libver_bounds(fapl, H5F_LIBVER_V110, H5F_LIBVER_V110);
+
+    hid_t file = H5Fcreate(filename, H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
+
+    hsize_t dims[2] = {6, 4};
+    hsize_t maxdims[2] = {H5S_UNLIMITED, H5S_UNLIMITED};
+    hid_t space = H5Screate_simple(2, dims, maxdims);
+
+    hid_t dcpl = H5Pcreate(H5P_DATASET_CREATE);
+    hsize_t chunk_dims[2] = {3, 2};
+    H5Pset_chunk(dcpl, 2, chunk_dims);
+    H5Pset_deflate(dcpl, 6);
+
+    hid_t dset = H5Dcreate2(file, "filtered", H5T_STD_I32LE, space,
+                             H5P_DEFAULT, dcpl, H5P_DEFAULT);
+
+    int32_t vals[24];
+    for (int i = 0; i < 24; i++) vals[i] = i;
+    H5Dwrite(dset, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, vals);
+
+    H5Dclose(dset);
+    H5Pclose(dcpl);
+    H5Sclose(space);
+    H5Fclose(file);
+    H5Pclose(fapl);
+    printf("Created %s\n", filename);
+}
+
 int main(void)
 {
     create_simple_contiguous("simple_contiguous_v2.h5");
@@ -1026,5 +1096,7 @@ int main(void)
     create_nbit("nbit.h5");
     create_scaleoffset("scaleoffset.h5");
     create_filtered_fheap("filtered_fheap.h5");
+    create_btree_v2_deep("btree_v2_deep.h5");
+    create_btree_v2_filtered("btree_v2_filtered.h5");
     return 0;
 }

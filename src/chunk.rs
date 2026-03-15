@@ -1018,12 +1018,10 @@ fn read_btree_v1_entries<R: ReadAt + ?Sized>(
 
 /// Read chunk entries from a B-tree v2 chunk index (layout v4, index type 5).
 ///
-/// B-tree v2 type 10 records (non-filtered): scaled_offsets[ndims] + address
-/// B-tree v2 type 11 records (filtered): scaled_offsets[ndims] + address + nbytes + filter_mask
+/// B-tree v2 type 10 records (non-filtered): address + scaled_offsets[ndims]
+/// B-tree v2 type 11 records (filtered): address + nbytes + filter_mask + scaled_offsets[ndims]
 ///
-/// The scaled offsets use variable-width encoding: for each dimension, the minimum
-/// bytes needed to represent the maximum number of chunks in that dimension.
-/// Unlimited dimensions use 8 bytes.
+/// Scaled offsets are always 8 bytes per dimension (UINT64DECODE).
 fn read_btree_v2_chunk_entries<R: ReadAt + ?Sized>(
     reader: &R,
     bt2_addr: u64,
@@ -1033,33 +1031,24 @@ fn read_btree_v2_chunk_entries<R: ReadAt + ?Sized>(
     has_filters: bool,
     size_of_offsets: u8,
     size_of_lengths: u8,
-    max_dims: Option<&[u64]>,
+    _max_dims: Option<&[u64]>,
 ) -> Result<Vec<ChunkEntry>> {
     use crate::btree2::{self, BTree2Header};
 
     let ndims = dataset_dims.len();
 
-    // Compute the encoding size for each dimension's scaled offset
-    let dim_encode_sizes: Vec<usize> = (0..ndims)
-        .map(|i| {
-            let max_dim = max_dims
-                .and_then(|md| md.get(i).copied())
-                .unwrap_or(dataset_dims[i]);
-            if max_dim == u64::MAX {
-                // Unlimited dimension
-                8
-            } else {
-                let max_chunks = (max_dim + chunk_dims[i] as u64 - 1) / chunk_dims[i] as u64;
-                bytes_needed_for(max_chunks)
-            }
-        })
-        .collect();
-
-    // Compute chunk_size_len for filtered records
+    // Compute chunk_size_len for filtered records using HDF5 formula:
+    // chunk_size_len = 1 + (floor(log2(chunk_size)) + 8) / 8, capped at 8
+    // (H5Dbtree2.c H5D_BT2_COMPUTE_CHUNK_SIZE_LEN)
     let chunk_byte_size: u64 = chunk_dims.iter().map(|&d| d as u64).product::<u64>()
         * element_size as u64;
     let chunk_size_len = if has_filters {
-        bytes_needed_for(chunk_byte_size)
+        if chunk_byte_size == 0 {
+            1
+        } else {
+            let log2 = 63 - chunk_byte_size.leading_zeros() as usize;
+            (1 + (log2 + 8) / 8).min(8)
+        }
     } else {
         0
     };
@@ -1074,31 +1063,39 @@ fn read_btree_v2_chunk_entries<R: ReadAt + ?Sized>(
         let data = &record.data;
         let mut pos = 0;
 
-        // Read chunk address first (HDF5 stores address before scaled offsets)
+        // Read chunk address first
         let address = read_var_uint_slice(data, pos, o);
         pos += o;
 
-        // Read scaled offsets
-        let mut scaled = Vec::with_capacity(ndims);
-        for i in 0..ndims {
-            let enc_size = dim_encode_sizes[i];
-            let val = read_var_uint_slice(data, pos, enc_size);
-            scaled.push(val);
-            pos += enc_size;
-        }
-
+        // For filtered records: nbytes + filter_mask come BEFORE scaled offsets
+        // (H5Dbtree2.c H5D__bt2_filt_decode)
         let (filtered_size, filter_mask) = if has_filters {
             let nbytes = read_var_uint_slice(data, pos, chunk_size_len);
             pos += chunk_size_len;
-            let fmask = if pos + 4 <= data.len() {
-                u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
-            } else {
-                0
-            };
+            let fmask =
+                u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+            pos += 4;
             (nbytes, fmask)
         } else {
             (0, 0)
         };
+
+        // Read scaled offsets — fixed 8 bytes (UINT64DECODE) per dimension
+        let mut scaled = Vec::with_capacity(ndims);
+        for _ in 0..ndims {
+            let val = u64::from_le_bytes([
+                data[pos],
+                data[pos + 1],
+                data[pos + 2],
+                data[pos + 3],
+                data[pos + 4],
+                data[pos + 5],
+                data[pos + 6],
+                data[pos + 7],
+            ]);
+            scaled.push(val);
+            pos += 8;
+        }
 
         entries.push(ChunkEntry {
             address,
@@ -1110,19 +1107,6 @@ fn read_btree_v2_chunk_entries<R: ReadAt + ?Sized>(
     })?;
 
     Ok(entries)
-}
-
-/// Minimum bytes needed to represent value `v` (1, 2, 4, or 8).
-fn bytes_needed_for(v: u64) -> usize {
-    if v <= 0xFF {
-        1
-    } else if v <= 0xFFFF {
-        2
-    } else if v <= 0xFFFF_FFFF {
-        4
-    } else {
-        8
-    }
 }
 
 fn read_var_uint_slice(data: &[u8], offset: usize, size: usize) -> u64 {
