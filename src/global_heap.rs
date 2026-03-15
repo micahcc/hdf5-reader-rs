@@ -27,7 +27,7 @@ const GCOL_MAGIC: &[u8; 4] = b"GCOL";
 /// ```
 ///
 /// An object with index 0 marks free space.
-
+///
 /// Read a single object from a global heap collection.
 ///
 /// `collection_addr` is the file offset of the "GCOL" signature.

@@ -636,7 +636,7 @@ impl Datatype {
     }
 
     fn parse_array(version: u8, props: &[u8]) -> Result<Self> {
-        if props.len() < 1 {
+        if props.is_empty() {
             return Err(Error::InvalidDatatype {
                 msg: "array properties too short".into(),
             });

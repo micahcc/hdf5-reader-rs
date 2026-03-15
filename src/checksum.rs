@@ -4,7 +4,7 @@
 /// in superblock v2/v3, object headers, B-tree v2 nodes, and fractal heap blocks.
 ///
 /// Reference: H5checksum.c in the HDF5 C library.
-
+///
 /// Compute the HDF5 checksum (Jenkins lookup3 hashlittle2) over `data`.
 ///
 /// Returns the hash value that HDF5 stores as the checksum field.

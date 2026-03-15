@@ -335,8 +335,8 @@ impl DataLayout {
 
 fn read_var_uint(data: &[u8], size: usize) -> u64 {
     let mut result = 0u64;
-    for i in 0..size.min(8) {
-        result |= (data[i] as u64) << (i * 8);
+    for (i, &byte) in data.iter().enumerate().take(size.min(8)) {
+        result |= (byte as u64) << (i * 8);
     }
     result
 }

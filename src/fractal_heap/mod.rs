@@ -256,7 +256,7 @@ impl FractalHeapHeader {
         if self.max_direct_block_size == 0 || self.starting_block_size == 0 {
             return 0;
         }
-        (self.max_direct_block_size / self.starting_block_size).trailing_zeros() as u32 + 2
+        (self.max_direct_block_size / self.starting_block_size).trailing_zeros() + 2
     }
 
     /// Number of rows in a child indirect block at a given row.
@@ -271,7 +271,7 @@ impl FractalHeapHeader {
     /// Number of bytes needed to encode a block offset within the heap.
     /// This is ceil(max_heap_size_bits / 8).
     pub fn block_offset_byte_size(&self) -> usize {
-        ((self.max_heap_size_bits as usize) + 7) / 8
+        (self.max_heap_size_bits as usize).div_ceil(8)
     }
 
     /// True if the root block is a direct block (current_root_rows == 0).
@@ -510,7 +510,7 @@ fn decode_managed_heap_id(heap_id: &[u8], offset_bits: usize, id_len: usize) -> 
     // For managed objects:
     //   Bytes 1..: offset (ceil(offset_bits/8) bytes, LE) followed by length (remaining bytes, LE)
 
-    let offset_bytes = (offset_bits + 7) / 8;
+    let offset_bytes = offset_bits.div_ceil(8);
     let length_bytes = id_len - 1 - offset_bytes;
 
     if heap_id.len() < 1 + offset_bytes + length_bytes {
@@ -528,8 +528,8 @@ fn decode_managed_heap_id(heap_id: &[u8], offset_bits: usize, id_len: usize) -> 
 /// Read variable-length little-endian unsigned integer.
 fn read_var_le(data: &[u8], len: usize) -> u64 {
     let mut result = 0u64;
-    for i in 0..len.min(8) {
-        result |= (data[i] as u64) << (i * 8);
+    for (i, &byte) in data.iter().enumerate().take(len.min(8)) {
+        result |= (byte as u64) << (i * 8);
     }
     result
 }

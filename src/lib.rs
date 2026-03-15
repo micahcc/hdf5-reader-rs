@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+
 //! Pure Rust HDF5 file reader.
 //!
 //! Supports superblock version 2 and 3 (HDF5 1.8+ / 1.10+ files).

@@ -455,7 +455,7 @@ fn read_implicit_chunk_entries(
 ) -> Result<Vec<ChunkEntry>> {
     let ndims = dataset_dims.len();
     let chunks_per_dim: Vec<u64> = (0..ndims)
-        .map(|i| (dataset_dims[i] + chunk_dims[i] as u64 - 1) / chunk_dims[i] as u64)
+        .map(|i| dataset_dims[i].div_ceil(chunk_dims[i] as u64))
         .collect();
 
     let total_chunks: u64 = chunks_per_dim.iter().product();
@@ -570,7 +570,7 @@ fn read_fixed_array_entries<R: ReadAt + ?Sized>(
     let ndims = dataset_dims.len();
 
     let chunks_per_dim: Vec<u64> = (0..ndims)
-        .map(|i| (dataset_dims[i] + chunk_dims[i] as u64 - 1) / chunk_dims[i] as u64)
+        .map(|i| dataset_dims[i].div_ceil(chunk_dims[i] as u64))
         .collect();
 
     let mut entries = Vec::with_capacity(nelmts as usize);
@@ -701,7 +701,7 @@ fn read_extensible_array_entries<R: ReadAt + ?Sized>(
 
     let ndims = dataset_dims.len();
     let chunks_per_dim: Vec<u64> = (0..ndims)
-        .map(|i| (dataset_dims[i] + chunk_dims[i] as u64 - 1) / chunk_dims[i] as u64)
+        .map(|i| dataset_dims[i].div_ceil(chunk_dims[i] as u64))
         .collect();
 
     let mut entries = Vec::new();
@@ -805,13 +805,13 @@ fn read_extensible_array_entries<R: ReadAt + ?Sized>(
         }
 
         // Super block: magic(4) + version(1) + client_id(1) + hdr_addr(O) + arr_off(varies)
-        let arr_off_size = ((max_nelmts_bits as u64 + 7) / 8).max(1);
+        let arr_off_size = (max_nelmts_bits as u64).div_ceil(8).max(1);
         let sb_prefix = 4 + 1 + 1 + o + arr_off_size;
 
         // Number of data blocks in this super block: doubles with each super block pair
         let sblk_ndblks = sup_blk_min_data_ptrs * (1u64 << (sblk_idx / 2));
         // Elements per data block in this super block
-        let sblk_dblk_nelmts = data_blk_min_elmts * (1u64 << ((sblk_idx + 1) / 2));
+        let sblk_dblk_nelmts = data_blk_min_elmts * (1u64 << (sblk_idx.div_ceil(2)));
 
         let sb_dblk_addrs_start = sblk_addr + sb_prefix;
 
@@ -912,7 +912,7 @@ fn read_ea_data_block_entries<R: ReadAt + ?Sized>(
     }
 
     // Data block prefix: magic(4) + version(1) + client_id(1) + hdr_addr(O) + arr_off(varies)
-    let arr_off_size = ((max_nelmts_bits as u64 + 7) / 8).max(1);
+    let arr_off_size = (max_nelmts_bits as u64).div_ceil(8).max(1);
     let prefix_size = 4 + 1 + 1 + o + arr_off_size;
     let elmts_start = dblk_addr + prefix_size;
 
@@ -1291,8 +1291,8 @@ fn read_var_le<R: ReadAt + ?Sized>(reader: &R, offset: u64, size: usize) -> Resu
         .read_exact_at(offset, &mut buf[..n])
         .map_err(Error::Io)?;
     let mut result = 0u64;
-    for i in 0..n {
-        result |= (buf[i] as u64) << (i * 8);
+    for (i, &byte) in buf.iter().enumerate().take(n) {
+        result |= (byte as u64) << (i * 8);
     }
     Ok(result)
 }

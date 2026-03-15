@@ -284,6 +284,7 @@ pub enum Node<'a, R: ReadAt + ?Sized> {
 /// A group (directory-like container) in the HDF5 file.
 pub struct Group<'a, R: ReadAt + ?Sized> {
     file: &'a File<R>,
+    #[allow(dead_code)]
     address: u64,
     header: ObjectHeader,
 }
@@ -540,6 +541,7 @@ impl<'a, R: ReadAt + ?Sized> Group<'a, R> {
 /// A dataset in the HDF5 file.
 pub struct Dataset<'a, R: ReadAt + ?Sized> {
     file: &'a File<R>,
+    #[allow(dead_code)]
     address: u64,
     header: ObjectHeader,
 }

@@ -176,6 +176,7 @@ pub struct Record {
 /// Per-depth-level node capacity information, matching H5B2_node_info_t in the C library.
 struct NodeInfo {
     /// Maximum records in a node at this depth level.
+    #[allow(dead_code)]
     max_nrec: usize,
     /// Maximum total records in a subtree rooted at this depth level.
     cum_max_nrec: u64,
