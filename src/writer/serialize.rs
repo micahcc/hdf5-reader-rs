@@ -2,23 +2,23 @@ use crate::error::{Error, Result};
 use crate::object_header::messages::MessageType;
 use crate::superblock::UNDEF_ADDR;
 
-use super::chunk_index::{
+use crate::writer::chunk_index::{
     write_btree_v1_chunk_index, write_btree_v2_chunk_index, write_extensible_array_index,
     write_fixed_array_index,
 };
-use super::chunk_util::{compute_chunk_count, enumerate_chunks, extract_chunk_data};
-use super::dataset_node::DatasetNode;
-use super::encode::{
+use crate::writer::chunk_util::{compute_chunk_count, enumerate_chunks, extract_chunk_data};
+use crate::writer::dataset_node::DatasetNode;
+use crate::writer::encode::{
     SIZE_OF_OFFSETS, encode_attribute, encode_chunked_layout, encode_compact_layout,
     encode_contiguous_layout, encode_dataspace, encode_datatype, encode_fill_value_msg,
     encode_filter_pipeline, encode_group_info, encode_link, encode_link_info,
     encode_object_header, ohdr_overhead,
 };
-use super::file_writer::WriteOptions;
-use super::gcol::{build_global_heap_collection, build_vlen_heap_ids};
-use super::group_node::GroupNode;
-use super::types::{ChildNode, StorageLayout};
-use super::write_filters::apply_filters_forward;
+use crate::writer::file_writer::WriteOptions;
+use crate::writer::gcol::{build_global_heap_collection, build_vlen_heap_ids};
+use crate::writer::group_node::GroupNode;
+use crate::writer::types::{ChildNode, StorageLayout};
+use crate::writer::write_filters::apply_filters_forward;
 
 pub(crate) fn write_group(
     group: &GroupNode,
@@ -65,7 +65,7 @@ fn write_dataset(ds: &DatasetNode, buf: &mut Vec<u8>, opts: &WriteOptions) -> Re
             let attr_bodies: Vec<Vec<u8>> = ds
                 .attributes
                 .iter()
-                .map(|a| encode_attribute(a))
+                .map(encode_attribute)
                 .collect::<Result<Vec<_>>>()?;
             let layout_body_size = 18usize;
             let total_msg_size: usize = [&dt_body, &ds_body, &fv_body]
@@ -138,7 +138,7 @@ fn write_dataset(ds: &DatasetNode, buf: &mut Vec<u8>, opts: &WriteOptions) -> Re
             let attr_bodies: Vec<Vec<u8>> = ds
                 .attributes
                 .iter()
-                .map(|a| encode_attribute(a))
+                .map(encode_attribute)
                 .collect::<Result<Vec<_>>>()?;
             let layout_body = encode_compact_layout(&ds.data);
 
@@ -166,7 +166,7 @@ fn write_dataset(ds: &DatasetNode, buf: &mut Vec<u8>, opts: &WriteOptions) -> Re
             let attr_bodies: Vec<Vec<u8>> = ds
                 .attributes
                 .iter()
-                .map(|a| encode_attribute(a))
+                .map(encode_attribute)
                 .collect::<Result<Vec<_>>>()?;
             let has_filters = !filters.is_empty();
             let filter_body = if has_filters {
@@ -216,8 +216,8 @@ fn write_dataset(ds: &DatasetNode, buf: &mut Vec<u8>, opts: &WriteOptions) -> Re
             layout_body.push(2);
             layout_body.push(dimensionality as u8);
             layout_body.extend_from_slice(&btree_addr.to_le_bytes());
-            for d in 0..ndims {
-                layout_body.extend_from_slice(&(chunk_dims[d] as u32).to_le_bytes());
+            for dim in &chunk_dims[..ndims] {
+                layout_body.extend_from_slice(&(*dim as u32).to_le_bytes());
             }
             layout_body.extend_from_slice(&element_size.to_le_bytes());
             debug_assert_eq!(layout_body.len(), layout_body_size);
@@ -264,7 +264,7 @@ fn write_dataset(ds: &DatasetNode, buf: &mut Vec<u8>, opts: &WriteOptions) -> Re
             let attr_bodies: Vec<Vec<u8>> = ds
                 .attributes
                 .iter()
-                .map(|a| encode_attribute(a))
+                .map(encode_attribute)
                 .collect::<Result<Vec<_>>>()?;
 
             let chunk_elements: u64 = chunk_dims.iter().product();
@@ -353,7 +353,7 @@ fn write_dataset(ds: &DatasetNode, buf: &mut Vec<u8>, opts: &WriteOptions) -> Re
                     },
                 ),
                 2 => (chunk_data_start, None),
-                3 | 4 | 5 => (pos, None),
+                3..=5 => (pos, None),
                 _ => (pos, None),
             };
 

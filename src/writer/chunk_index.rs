@@ -2,8 +2,8 @@ use crate::checksum;
 use crate::error::Result;
 use crate::superblock::UNDEF_ADDR;
 
-use super::chunk_util::enumerate_chunks;
-use super::encode::{SIZE_OF_OFFSETS, limit_enc_size_u64};
+use crate::writer::chunk_util::enumerate_chunks;
+use crate::writer::encode::{SIZE_OF_OFFSETS, limit_enc_size_u64};
 
 /// Write a variable-length little-endian integer.
 fn write_var_le(buf: &mut Vec<u8>, value: u64, nbytes: usize) {
@@ -314,9 +314,7 @@ pub(crate) fn write_extensible_array_index(
         } else {
             ib.extend_from_slice(&UNDEF_ADDR.to_le_bytes());
             if has_filters {
-                for _ in 0..(elem_size as usize - o) {
-                    ib.push(0);
-                }
+                ib.extend(std::iter::repeat_n(0u8, elem_size as usize - o));
             }
         }
     }
@@ -366,9 +364,7 @@ pub(crate) fn write_extensible_array_index(
             } else {
                 db.extend_from_slice(&UNDEF_ADDR.to_le_bytes());
                 if has_filters {
-                    for _ in 0..(elem_size as usize - o) {
-                        db.push(0);
-                    }
+                    db.extend(std::iter::repeat_n(0u8, elem_size as usize - o));
                 }
             }
         }
@@ -424,9 +420,7 @@ pub(crate) fn write_extensible_array_index(
                 } else {
                     db.extend_from_slice(&UNDEF_ADDR.to_le_bytes());
                     if has_filters {
-                        for _ in 0..(elem_size as usize - o) {
-                            db.push(0);
-                        }
+                        db.extend(std::iter::repeat_n(0u8, elem_size as usize - o));
                     }
                 }
             }
@@ -532,8 +526,8 @@ pub(crate) fn write_btree_v2_chunk_index(
             write_var_le(&mut rec, chunk_sizes[i], chunk_size_len);
             rec.extend_from_slice(&0u32.to_le_bytes());
         }
-        for d in 0..ndims {
-            rec.extend_from_slice(&coords[d].to_le_bytes());
+        for coord in &coords[..ndims] {
+            rec.extend_from_slice(&coord.to_le_bytes());
         }
         debug_assert_eq!(rec.len(), record_size);
         records.push(rec);

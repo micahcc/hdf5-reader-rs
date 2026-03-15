@@ -1,6 +1,6 @@
 use crate::datatype::Datatype;
 
-use super::types::{AttrData, ChunkFilter, StorageLayout};
+use crate::writer::types::{AttrData, ChunkFilter, StorageLayout};
 
 /// A dataset node in the file builder tree.
 pub struct DatasetNode {

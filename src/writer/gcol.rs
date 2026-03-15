@@ -1,4 +1,4 @@
-use super::encode::{SIZE_OF_LENGTHS, SIZE_OF_OFFSETS};
+use crate::writer::encode::{SIZE_OF_LENGTHS, SIZE_OF_OFFSETS};
 use crate::superblock::UNDEF_ADDR;
 
 /// Build a global heap collection (GCOL) containing all vlen elements.

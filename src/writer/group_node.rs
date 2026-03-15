@@ -1,7 +1,7 @@
 use crate::datatype::Datatype;
 
-use super::DatasetNode;
-use super::types::{AttrData, ChildNode};
+use crate::writer::DatasetNode;
+use crate::writer::types::{AttrData, ChildNode};
 
 /// A group node in the file builder tree.
 pub struct GroupNode {

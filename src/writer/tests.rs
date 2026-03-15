@@ -1,5 +1,5 @@
 use super::*;
-use super::encode::{
+use crate::writer::encode::{
     SUPERBLOCK_SIZE, encode_dataspace, encode_datatype, encode_superblock,
 };
 use crate::File;

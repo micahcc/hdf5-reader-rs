@@ -1,7 +1,7 @@
 use crate::error::Error;
 use crate::error::Result;
 
-use super::types::ChunkFilter;
+use crate::writer::types::ChunkFilter;
 
 /// Apply filters in forward direction (compression) to chunk data.
 pub(crate) fn apply_filters_forward(

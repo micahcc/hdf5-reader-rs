@@ -9,8 +9,8 @@ use crate::filters;
 use crate::superblock::HDF5_SIGNATURE;
 use crate::superblock::UNDEF_ADDR;
 
-use super::file_writer::WriteOptions;
-use super::types::{AttrData, ChunkFilter};
+use crate::writer::file_writer::WriteOptions;
+use crate::writer::types::{AttrData, ChunkFilter};
 
 pub(crate) const SIZE_OF_OFFSETS: u8 = 8;
 pub(crate) const SIZE_OF_LENGTHS: u8 = 8;
@@ -227,11 +227,7 @@ pub(crate) fn encode_datatype(dt: &Datatype) -> Result<Vec<u8>> {
             let ndims = dimensions.len() as u8;
             let total_elements: u32 = dimensions.iter().product();
             let elem_size = total_elements * element_type.element_size();
-            let mut buf = Vec::new();
-            buf.push(class_version_byte);
-            buf.push(0);
-            buf.push(0);
-            buf.push(0);
+            let mut buf = vec![class_version_byte, 0, 0, 0];
             buf.extend_from_slice(&elem_size.to_le_bytes());
             buf.push(ndims);
             for d in dimensions {
@@ -242,11 +238,7 @@ pub(crate) fn encode_datatype(dt: &Datatype) -> Result<Vec<u8>> {
         }
         Datatype::Complex { size, base } => {
             let class_version_byte = (11u8) | (5u8 << 4);
-            let mut buf = Vec::new();
-            buf.push(class_version_byte);
-            buf.push(0x01);
-            buf.push(0);
-            buf.push(0);
+            let mut buf = vec![class_version_byte, 0x01, 0, 0];
             buf.extend_from_slice(&size.to_le_bytes());
             buf.extend_from_slice(&encode_datatype(base)?);
             Ok(buf)
@@ -280,11 +272,7 @@ pub(crate) fn encode_datatype(dt: &Datatype) -> Result<Vec<u8>> {
                 }
             }
             let vlen_element_size: u32 = 4 + SIZE_OF_OFFSETS as u32 + 4;
-            let mut buf = Vec::new();
-            buf.push(class_version_byte);
-            buf.push(class_bits_lo);
-            buf.push(class_bits_hi);
-            buf.push(0);
+            let mut buf = vec![class_version_byte, class_bits_lo, class_bits_hi, 0];
             buf.extend_from_slice(&vlen_element_size.to_le_bytes());
             buf.extend_from_slice(&encode_datatype(element_type)?);
             Ok(buf)
@@ -431,12 +419,7 @@ pub(crate) fn encode_chunked_layout(
         flags |= 0x02;
     }
 
-    let mut buf = Vec::new();
-    buf.push(4);
-    buf.push(2);
-    buf.push(flags);
-    buf.push(ndims);
-    buf.push(enc_bytes);
+    let mut buf = vec![4, 2, flags, ndims, enc_bytes];
 
     for &dim in chunk_dims {
         match enc_bytes {

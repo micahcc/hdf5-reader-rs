@@ -1,8 +1,8 @@
 use crate::error::{Error, Result};
 
-use super::encode::{encode_superblock, SUPERBLOCK_SIZE};
-use super::serialize::write_group;
-use super::GroupNode;
+use crate::writer::encode::{encode_superblock, SUPERBLOCK_SIZE};
+use crate::writer::serialize::write_group;
+use crate::writer::GroupNode;
 
 /// Options controlling how the HDF5 file is written.
 #[derive(Debug, Clone, Default)]

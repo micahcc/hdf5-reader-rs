@@ -2,7 +2,7 @@
 pub(crate) fn compute_chunk_count(shape: &[u64], chunk_dims: &[u64]) -> usize {
     let mut total = 1usize;
     for (s, c) in shape.iter().zip(chunk_dims.iter()) {
-        total *= ((*s + *c - 1) / *c) as usize;
+        total *= (*s).div_ceil(*c) as usize;
     }
     total
 }
@@ -12,13 +12,13 @@ pub(crate) fn enumerate_chunks(shape: &[u64], chunk_dims: &[u64]) -> Vec<Vec<u64
     let ndims = shape.len();
     let mut chunks_per_dim: Vec<u64> = Vec::with_capacity(ndims);
     for i in 0..ndims {
-        chunks_per_dim.push((shape[i] + chunk_dims[i] - 1) / chunk_dims[i]);
+        chunks_per_dim.push(shape[i].div_ceil(chunk_dims[i]));
     }
     let total: usize = chunks_per_dim.iter().map(|&c| c as usize).product();
     let mut result = Vec::with_capacity(total);
     let mut coord = vec![0u64; ndims];
     for _ in 0..total {
-        result.push(coord.iter().copied().collect());
+        result.push(coord.to_vec());
         for d in (0..ndims).rev() {
             coord[d] += 1;
             if coord[d] < chunks_per_dim[d] {

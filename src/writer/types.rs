@@ -1,7 +1,7 @@
 use crate::datatype::Datatype;
 
-use super::DatasetNode;
-use super::GroupNode;
+use crate::writer::DatasetNode;
+use crate::writer::GroupNode;
 
 /// A filter to apply in a chunked dataset's filter pipeline.
 #[derive(Debug, Clone)]
@@ -16,8 +16,10 @@ pub enum ChunkFilter {
 
 /// Storage layout for a dataset.
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub enum StorageLayout {
     /// Data stored in a contiguous block after the object header.
+    #[default]
     Contiguous,
     /// Data stored inline in the object header (small datasets only).
     Compact,
@@ -28,11 +30,6 @@ pub enum StorageLayout {
     },
 }
 
-impl Default for StorageLayout {
-    fn default() -> Self {
-        StorageLayout::Contiguous
-    }
-}
 
 pub(crate) enum ChildNode {
     Group(GroupNode),
