@@ -395,7 +395,7 @@ impl Datatype {
                     pos += 4;
                     off
                 }
-                3 | 4 => {
+                3..=5 => {
                     // Offset width: H5VM_limit_enc_size(size) = (log2(size)/8) + 1
                     let off_size = if size <= 0xFF {
                         1

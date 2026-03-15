@@ -89,7 +89,10 @@ impl DataLayout {
 
         match version {
             3 => Self::parse_v3(data, layout_class, size_of_offsets, size_of_lengths),
-            4 => Self::parse_v4(data, layout_class, size_of_offsets, size_of_lengths),
+            // v5 uses the same on-disk format as v4; the version bump only changes
+            // which filtered-chunk size encoding the library *writes* (size_of_lengths
+            // width), but the decode path is identical.
+            4 | 5 => Self::parse_v4(data, layout_class, size_of_offsets, size_of_lengths),
             _ => Err(Error::InvalidLayout {
                 msg: format!("unsupported layout message version {}", version),
             }),
