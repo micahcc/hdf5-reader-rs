@@ -374,7 +374,7 @@ impl Datatype {
 
             // V1/v2: pad name (incl. null terminator) to 8-byte multiple from name start.
             // C formula: *pp += ((strlen + 8) / 8) * 8  (H5Odtype.c:427)
-            if version < 3 {
+            if version <= 2 {
                 pos = name_start + ((name_len + 8) / 8) * 8;
             }
 
@@ -395,7 +395,7 @@ impl Datatype {
                     pos += 4;
                     off
                 }
-                3 => {
+                3 | 4 => {
                     // Offset width: H5VM_limit_enc_size(size) = (log2(size)/8) + 1
                     let off_size = if size <= 0xFF {
                         1
@@ -504,7 +504,7 @@ impl Datatype {
                         pos = name_start + ((name_len + 8) / 8) * 8;
                     }
                     // byte offset
-                    if version == 3 {
+                    if version >= 3 {
                         let off_size = if size <= 0xFF {
                             1
                         } else if size <= 0xFFFF {

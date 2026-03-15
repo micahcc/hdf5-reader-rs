@@ -106,6 +106,7 @@ name = "hdf5-reader"
 version = "0.1.0"
 dependencies = [
  "flate2",
+ "serde_json",
  "tempfile",
  "thiserror",
 ]
