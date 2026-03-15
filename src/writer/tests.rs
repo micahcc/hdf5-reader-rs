@@ -1,0 +1,776 @@
+use super::*;
+use super::encode::{
+    SUPERBLOCK_SIZE, encode_dataspace, encode_datatype, encode_superblock,
+};
+use crate::File;
+use crate::dataspace::Dataspace;
+use crate::datatype::ByteOrder;
+
+#[test]
+fn encode_superblock_roundtrip() {
+    let sb_bytes = encode_superblock(48, 1024);
+    assert_eq!(sb_bytes.len(), SUPERBLOCK_SIZE);
+    let sb = crate::superblock::Superblock::parse(sb_bytes.as_slice(), 0).unwrap();
+    assert_eq!(sb.version, 2);
+    assert_eq!(sb.size_of_offsets, 8);
+    assert_eq!(sb.size_of_lengths, 8);
+    assert_eq!(sb.root_group_object_header_address, 48);
+    assert_eq!(sb.end_of_file_address, 1024);
+}
+
+#[test]
+fn encode_datatype_i32() {
+    let dt = crate::Datatype::native_i32();
+    let enc = encode_datatype(&dt).unwrap();
+    assert_eq!(enc.len(), 12);
+    let parsed = crate::Datatype::parse(&enc).unwrap();
+    match parsed {
+        crate::Datatype::FixedPoint {
+            size,
+            byte_order,
+            signed,
+            bit_offset,
+            bit_precision,
+        } => {
+            assert_eq!(size, 4);
+            assert_eq!(byte_order, ByteOrder::LittleEndian);
+            assert!(signed);
+            assert_eq!(bit_offset, 0);
+            assert_eq!(bit_precision, 32);
+        }
+        _ => panic!("expected FixedPoint"),
+    }
+}
+
+#[test]
+fn encode_datatype_f64() {
+    let dt = crate::Datatype::native_f64();
+    let enc = encode_datatype(&dt).unwrap();
+    assert_eq!(enc.len(), 20);
+    let parsed = crate::Datatype::parse(&enc).unwrap();
+    match parsed {
+        crate::Datatype::FloatingPoint {
+            size,
+            byte_order,
+            bit_precision,
+            exponent_location,
+            exponent_size,
+            mantissa_size,
+            exponent_bias,
+            ..
+        } => {
+            assert_eq!(size, 8);
+            assert_eq!(byte_order, ByteOrder::LittleEndian);
+            assert_eq!(bit_precision, 64);
+            assert_eq!(exponent_location, 52);
+            assert_eq!(exponent_size, 11);
+            assert_eq!(mantissa_size, 52);
+            assert_eq!(exponent_bias, 1023);
+        }
+        _ => panic!("expected FloatingPoint"),
+    }
+}
+
+#[test]
+fn encode_datatype_string() {
+    use crate::datatype::{CharacterSet, StringPadding};
+    let dt = crate::Datatype::fixed_string(10);
+    let enc = encode_datatype(&dt).unwrap();
+    assert_eq!(enc.len(), 8);
+    let parsed = crate::Datatype::parse(&enc).unwrap();
+    match parsed {
+        crate::Datatype::String {
+            size,
+            padding,
+            char_set,
+        } => {
+            assert_eq!(size, 10);
+            assert_eq!(padding, StringPadding::NullTerminate);
+            assert_eq!(char_set, CharacterSet::Ascii);
+        }
+        _ => panic!("expected String"),
+    }
+}
+
+#[test]
+fn encode_dataspace_scalar() {
+    let enc = encode_dataspace(&[], None);
+    assert_eq!(enc, vec![2, 0, 0, 0]);
+    let parsed = Dataspace::parse(&enc).unwrap();
+    assert!(matches!(parsed, Dataspace::Scalar));
+}
+
+#[test]
+fn encode_dataspace_1d() {
+    let enc = encode_dataspace(&[100], None);
+    assert_eq!(enc.len(), 12);
+    let parsed = Dataspace::parse(&enc).unwrap();
+    match parsed {
+        Dataspace::Simple { dimensions, .. } => assert_eq!(dimensions, vec![100]),
+        _ => panic!("expected Simple"),
+    }
+}
+
+#[test]
+fn encode_dataspace_2d() {
+    let enc = encode_dataspace(&[10, 20], None);
+    assert_eq!(enc.len(), 20);
+    let parsed = Dataspace::parse(&enc).unwrap();
+    match parsed {
+        Dataspace::Simple { dimensions, .. } => assert_eq!(dimensions, vec![10, 20]),
+        _ => panic!("expected Simple"),
+    }
+}
+
+#[test]
+fn roundtrip_empty_file() {
+    let w = FileWriter::new();
+    let bytes = w.to_bytes().unwrap();
+    let file = File::from_bytes(bytes.into_boxed_slice()).unwrap();
+    let root = file.root_group().unwrap();
+    assert!(root.members().unwrap().is_empty());
+}
+
+#[test]
+fn roundtrip_single_i32_dataset() {
+    let mut w = FileWriter::new();
+    let data: Vec<u8> = (0..10i32).flat_map(|x| x.to_le_bytes()).collect();
+    w.root_mut()
+        .add_dataset("numbers", crate::Datatype::native_i32(), &[10], data.clone());
+    let bytes = w.to_bytes().unwrap();
+
+    let file = File::from_bytes(bytes.into_boxed_slice()).unwrap();
+    let root = file.root_group().unwrap();
+    let members = root.members().unwrap();
+    assert_eq!(members.len(), 1);
+    assert_eq!(members[0], "numbers");
+
+    let ds = root.dataset("numbers").unwrap();
+    assert_eq!(ds.shape().unwrap(), vec![10]);
+    assert_eq!(ds.read_raw().unwrap(), data);
+}
+
+#[test]
+fn roundtrip_f64_dataset() {
+    let mut w = FileWriter::new();
+    let values: Vec<f64> = (0..5).map(|i| i as f64 * 1.5).collect();
+    let data: Vec<u8> = values.iter().flat_map(|x| x.to_le_bytes()).collect();
+    w.root_mut()
+        .add_dataset("floats", crate::Datatype::native_f64(), &[5], data.clone());
+    let bytes = w.to_bytes().unwrap();
+
+    let file = File::from_bytes(bytes.into_boxed_slice()).unwrap();
+    let ds = file.root_group().unwrap().dataset("floats").unwrap();
+    assert_eq!(ds.shape().unwrap(), vec![5]);
+    assert_eq!(ds.read_raw().unwrap(), data);
+}
+
+#[test]
+fn roundtrip_2d_dataset() {
+    let mut w = FileWriter::new();
+    let data: Vec<u8> = (0..12u16).flat_map(|x| x.to_le_bytes()).collect();
+    w.root_mut()
+        .add_dataset("matrix", crate::Datatype::native_u16(), &[3, 4], data.clone());
+    let bytes = w.to_bytes().unwrap();
+
+    let file = File::from_bytes(bytes.into_boxed_slice()).unwrap();
+    let ds = file.root_group().unwrap().dataset("matrix").unwrap();
+    assert_eq!(ds.shape().unwrap(), vec![3, 4]);
+    assert_eq!(ds.read_raw().unwrap(), data);
+}
+
+#[test]
+fn roundtrip_scalar_dataset() {
+    let mut w = FileWriter::new();
+    let data = 42i64.to_le_bytes().to_vec();
+    w.root_mut()
+        .add_dataset("scalar", crate::Datatype::native_i64(), &[], data.clone());
+    let bytes = w.to_bytes().unwrap();
+
+    let file = File::from_bytes(bytes.into_boxed_slice()).unwrap();
+    let ds = file.root_group().unwrap().dataset("scalar").unwrap();
+    assert_eq!(ds.shape().unwrap(), Vec::<u64>::new());
+    assert_eq!(ds.read_raw().unwrap(), data);
+}
+
+#[test]
+fn roundtrip_group() {
+    let mut w = FileWriter::new();
+    w.root_mut().add_group("grp1");
+    let bytes = w.to_bytes().unwrap();
+
+    let file = File::from_bytes(bytes.into_boxed_slice()).unwrap();
+    let root = file.root_group().unwrap();
+    let members = root.members().unwrap();
+    assert_eq!(members, vec!["grp1"]);
+    let grp = root.group("grp1").unwrap();
+    assert!(grp.members().unwrap().is_empty());
+}
+
+#[test]
+fn roundtrip_nested_groups() {
+    let mut w = FileWriter::new();
+    let grp = w.root_mut().add_group("outer");
+    grp.add_group("inner");
+    let bytes = w.to_bytes().unwrap();
+
+    let file = File::from_bytes(bytes.into_boxed_slice()).unwrap();
+    let root = file.root_group().unwrap();
+    let outer = root.group("outer").unwrap();
+    let inner = outer.group("inner").unwrap();
+    assert!(inner.members().unwrap().is_empty());
+}
+
+#[test]
+fn roundtrip_group_with_dataset() {
+    let mut w = FileWriter::new();
+    let grp = w.root_mut().add_group("data");
+    let vals: Vec<u8> = (0..4u32).flat_map(|x| x.to_le_bytes()).collect();
+    grp.add_dataset("values", crate::Datatype::native_u32(), &[4], vals.clone());
+    let bytes = w.to_bytes().unwrap();
+
+    let file = File::from_bytes(bytes.into_boxed_slice()).unwrap();
+    let grp = file.root_group().unwrap().group("data").unwrap();
+    let ds = grp.dataset("values").unwrap();
+    assert_eq!(ds.read_raw().unwrap(), vals);
+}
+
+#[test]
+fn roundtrip_group_attribute() {
+    let mut w = FileWriter::new();
+    let val = 123i32.to_le_bytes().to_vec();
+    w.root_mut()
+        .add_attribute("version", crate::Datatype::native_i32(), &[], val.clone());
+    let bytes = w.to_bytes().unwrap();
+
+    let file = File::from_bytes(bytes.into_boxed_slice()).unwrap();
+    let root = file.root_group().unwrap();
+    let attrs = root.attributes().unwrap();
+    assert_eq!(attrs.len(), 1);
+    assert_eq!(attrs[0].name, "version");
+    assert_eq!(attrs[0].raw_value, val);
+}
+
+#[test]
+fn roundtrip_dataset_attribute() {
+    let mut w = FileWriter::new();
+    let data: Vec<u8> = vec![1.0f64, 2.0, 3.0]
+        .iter()
+        .flat_map(|x| x.to_le_bytes())
+        .collect();
+    let ds = w
+        .root_mut()
+        .add_dataset("temps", crate::Datatype::native_f64(), &[3], data);
+    ds.add_attribute("units", crate::Datatype::fixed_string(7), &[], b"celsius".to_vec());
+    let bytes = w.to_bytes().unwrap();
+
+    let file = File::from_bytes(bytes.into_boxed_slice()).unwrap();
+    let ds = file.root_group().unwrap().dataset("temps").unwrap();
+    let attrs = ds.attributes().unwrap();
+    assert_eq!(attrs.len(), 1);
+    assert_eq!(attrs[0].name, "units");
+    assert_eq!(attrs[0].raw_value, b"celsius");
+}
+
+#[test]
+fn roundtrip_multiple_datasets() {
+    let mut w = FileWriter::new();
+    let root = w.root_mut();
+    let d1: Vec<u8> = (0..3i32).flat_map(|x| x.to_le_bytes()).collect();
+    let d2: Vec<u8> = (10..14u64).flat_map(|x| x.to_le_bytes()).collect();
+    root.add_dataset("ints", crate::Datatype::native_i32(), &[3], d1.clone());
+    root.add_dataset("longs", crate::Datatype::native_u64(), &[4], d2.clone());
+    let bytes = w.to_bytes().unwrap();
+
+    let file = File::from_bytes(bytes.into_boxed_slice()).unwrap();
+    let root = file.root_group().unwrap();
+    let ds1 = root.dataset("ints").unwrap();
+    assert_eq!(ds1.read_raw().unwrap(), d1);
+    let ds2 = root.dataset("longs").unwrap();
+    assert_eq!(ds2.read_raw().unwrap(), d2);
+}
+
+#[test]
+fn rejects_wrong_data_size() {
+    let mut w = FileWriter::new();
+    w.root_mut()
+        .add_dataset("bad", crate::Datatype::native_i32(), &[10], vec![0u8; 8]);
+    let err = w.to_bytes().unwrap_err();
+    assert!(err.to_string().contains("data size mismatch"));
+}
+
+#[test]
+fn roundtrip_all_integer_types() {
+    let mut w = FileWriter::new();
+    let root = w.root_mut();
+    root.add_dataset("i8", crate::Datatype::native_i8(), &[2], vec![1u8, 2]);
+    root.add_dataset(
+        "i16",
+        crate::Datatype::native_i16(),
+        &[2],
+        [1i16, 2].iter().flat_map(|x| x.to_le_bytes()).collect(),
+    );
+    root.add_dataset(
+        "u32",
+        crate::Datatype::native_u32(),
+        &[1],
+        100u32.to_le_bytes().to_vec(),
+    );
+    root.add_dataset(
+        "u64",
+        crate::Datatype::native_u64(),
+        &[1],
+        999u64.to_le_bytes().to_vec(),
+    );
+    let bytes = w.to_bytes().unwrap();
+
+    let file = File::from_bytes(bytes.into_boxed_slice()).unwrap();
+    let root = file.root_group().unwrap();
+    assert_eq!(root.dataset("i8").unwrap().read_raw().unwrap(), vec![1, 2]);
+}
+
+#[test]
+fn roundtrip_multiple_attributes() {
+    let mut w = FileWriter::new();
+    let root = w.root_mut();
+    root.add_attribute(
+        "a1",
+        crate::Datatype::native_i32(),
+        &[],
+        1i32.to_le_bytes().to_vec(),
+    );
+    root.add_attribute(
+        "a2",
+        crate::Datatype::native_f64(),
+        &[],
+        3.14f64.to_le_bytes().to_vec(),
+    );
+    let bytes = w.to_bytes().unwrap();
+
+    let file = File::from_bytes(bytes.into_boxed_slice()).unwrap();
+    let root = file.root_group().unwrap();
+    let attrs = root.attributes().unwrap();
+    assert_eq!(attrs.len(), 2);
+    let names: Vec<&str> = attrs.iter().map(|a| a.name.as_str()).collect();
+    assert!(names.contains(&"a1"));
+    assert!(names.contains(&"a2"));
+}
+
+#[test]
+fn roundtrip_complex_hierarchy() {
+    let mut w = FileWriter::new();
+    let root = w.root_mut();
+    root.add_attribute(
+        "file_version",
+        crate::Datatype::native_i32(),
+        &[],
+        1i32.to_le_bytes().to_vec(),
+    );
+
+    let data_grp = root.add_group("data");
+    let vals: Vec<u8> = [0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0]
+        .iter()
+        .flat_map(|x| x.to_le_bytes())
+        .collect();
+    let ds = data_grp.add_dataset("measurements", crate::Datatype::native_f32(), &[2, 3], vals);
+    ds.add_attribute("units", crate::Datatype::fixed_string(1), &[], b"m".to_vec());
+
+    let meta_grp = root.add_group("metadata");
+    meta_grp.add_attribute("author", crate::Datatype::fixed_string(4), &[], b"test".to_vec());
+
+    let bytes = w.to_bytes().unwrap();
+
+    let file = File::from_bytes(bytes.into_boxed_slice()).unwrap();
+    let root = file.root_group().unwrap();
+
+    let root_attrs = root.attributes().unwrap();
+    assert_eq!(root_attrs.len(), 1);
+    assert_eq!(root_attrs[0].name, "file_version");
+
+    let data = root.group("data").unwrap();
+    let ds = data.dataset("measurements").unwrap();
+    assert_eq!(ds.shape().unwrap(), vec![2, 3]);
+    let ds_attrs = ds.attributes().unwrap();
+    assert_eq!(ds_attrs.len(), 1);
+    assert_eq!(ds_attrs[0].name, "units");
+
+    let meta = root.group("metadata").unwrap();
+    let meta_attrs = meta.attributes().unwrap();
+    assert_eq!(meta_attrs.len(), 1);
+    assert_eq!(meta_attrs[0].name, "author");
+}
+
+#[test]
+fn roundtrip_with_timestamps() {
+    let ts = (1700000000, 1700000000, 1700000000, 1700000000);
+    let opts = WriteOptions {
+        timestamps: Some(ts),
+    };
+    let mut w = FileWriter::with_options(opts);
+    let data: Vec<u8> = (0..4i32).flat_map(|x| x.to_le_bytes()).collect();
+    w.root_mut()
+        .add_dataset("data", crate::Datatype::native_i32(), &[4], data.clone());
+    let bytes = w.to_bytes().unwrap();
+
+    let file = File::from_bytes(bytes.into_boxed_slice()).unwrap();
+    let root = file.root_group().unwrap();
+    let ds = root.dataset("data").unwrap();
+    assert_eq!(ds.read_raw().unwrap(), data);
+}
+
+#[test]
+fn timestamps_stored_in_object_header() {
+    let ts = (1700000000, 1700000001, 1700000002, 1700000003);
+    let opts = WriteOptions {
+        timestamps: Some(ts),
+    };
+    let mut w = FileWriter::with_options(opts);
+    w.root_mut().add_group("grp");
+    let bytes = w.to_bytes().unwrap();
+
+    let file = File::from_bytes(bytes.into_boxed_slice()).unwrap();
+    let root = file.root_group().unwrap();
+    assert_eq!(root.members().unwrap(), vec!["grp"]);
+}
+
+#[test]
+fn encode_datatype_compound() {
+    let dt = crate::Datatype::Compound {
+        size: 12,
+        members: vec![
+            crate::datatype::CompoundMember {
+                name: "id".to_string(),
+                byte_offset: 0,
+                datatype: crate::Datatype::native_i32(),
+            },
+            crate::datatype::CompoundMember {
+                name: "x".to_string(),
+                byte_offset: 4,
+                datatype: crate::Datatype::native_f32(),
+            },
+            crate::datatype::CompoundMember {
+                name: "y".to_string(),
+                byte_offset: 8,
+                datatype: crate::Datatype::native_f32(),
+            },
+        ],
+    };
+    let enc = encode_datatype(&dt).unwrap();
+    let parsed = crate::Datatype::parse(&enc).unwrap();
+    match &parsed {
+        crate::Datatype::Compound { size, members } => {
+            assert_eq!(*size, 12);
+            assert_eq!(members.len(), 3);
+            assert_eq!(members[0].name, "id");
+            assert_eq!(members[0].byte_offset, 0);
+            assert_eq!(members[1].name, "x");
+            assert_eq!(members[1].byte_offset, 4);
+            assert_eq!(members[2].name, "y");
+            assert_eq!(members[2].byte_offset, 8);
+        }
+        _ => panic!("expected Compound"),
+    }
+}
+
+#[test]
+fn encode_datatype_enum() {
+    let dt = crate::Datatype::Enum {
+        base: Box::new(crate::Datatype::native_i8()),
+        members: vec![
+            crate::datatype::EnumMember {
+                name: "RED".to_string(),
+                value: vec![0],
+            },
+            crate::datatype::EnumMember {
+                name: "GREEN".to_string(),
+                value: vec![1],
+            },
+            crate::datatype::EnumMember {
+                name: "BLUE".to_string(),
+                value: vec![2],
+            },
+        ],
+    };
+    let enc = encode_datatype(&dt).unwrap();
+    let parsed = crate::Datatype::parse(&enc).unwrap();
+    match &parsed {
+        crate::Datatype::Enum { base, members } => {
+            assert_eq!(base.element_size(), 1);
+            assert_eq!(members.len(), 3);
+            assert_eq!(members[0].name, "RED");
+            assert_eq!(members[0].value, vec![0]);
+            assert_eq!(members[1].name, "GREEN");
+            assert_eq!(members[1].value, vec![1]);
+            assert_eq!(members[2].name, "BLUE");
+            assert_eq!(members[2].value, vec![2]);
+        }
+        _ => panic!("expected Enum"),
+    }
+}
+
+#[test]
+fn encode_datatype_array() {
+    let dt = crate::Datatype::Array {
+        element_type: Box::new(crate::Datatype::native_i32()),
+        dimensions: vec![3],
+    };
+    let enc = encode_datatype(&dt).unwrap();
+    let parsed = crate::Datatype::parse(&enc).unwrap();
+    match &parsed {
+        crate::Datatype::Array {
+            element_type,
+            dimensions,
+        } => {
+            assert_eq!(dimensions, &[3]);
+            assert_eq!(element_type.element_size(), 4);
+            assert_eq!(parsed.element_size(), 12);
+        }
+        _ => panic!("expected Array"),
+    }
+}
+
+#[test]
+fn encode_datatype_complex() {
+    let dt = crate::Datatype::Complex {
+        size: 16,
+        base: Box::new(crate::Datatype::native_f64()),
+    };
+    let enc = encode_datatype(&dt).unwrap();
+    let parsed = crate::Datatype::parse(&enc).unwrap();
+    match &parsed {
+        crate::Datatype::Complex { size, base } => {
+            assert_eq!(*size, 16);
+            assert_eq!(base.element_size(), 8);
+        }
+        _ => panic!("expected Complex"),
+    }
+}
+
+#[test]
+fn roundtrip_compact_dataset() {
+    let mut w = FileWriter::new();
+    let data: Vec<u8> = [100i16, 200, 300, 400]
+        .iter()
+        .flat_map(|x| x.to_le_bytes())
+        .collect();
+    let ds = w
+        .root_mut()
+        .add_dataset("small", crate::Datatype::native_i16(), &[4], data.clone());
+    ds.set_layout(StorageLayout::Compact);
+    let bytes = w.to_bytes().unwrap();
+
+    let file = File::from_bytes(bytes.into_boxed_slice()).unwrap();
+    let root = file.root_group().unwrap();
+    let ds = root.dataset("small").unwrap();
+    assert_eq!(ds.shape().unwrap(), vec![4]);
+    assert_eq!(ds.read_raw().unwrap(), data);
+}
+
+#[test]
+fn roundtrip_fill_value() {
+    let mut w = FileWriter::new();
+    let data: Vec<u8> = [10i32, 20, 30, 40, -999, -999]
+        .iter()
+        .flat_map(|x| x.to_le_bytes())
+        .collect();
+    let ds = w
+        .root_mut()
+        .add_dataset("filled", crate::Datatype::native_i32(), &[6], data.clone());
+    ds.set_fill_value((-999i32).to_le_bytes().to_vec());
+    let bytes = w.to_bytes().unwrap();
+
+    let file = File::from_bytes(bytes.into_boxed_slice()).unwrap();
+    let root = file.root_group().unwrap();
+    let ds = root.dataset("filled").unwrap();
+    let fv = ds.fill_value().unwrap();
+    assert!(fv.defined);
+    let val_bytes = fv.value.expect("expected fill value bytes");
+    let fill_val = i32::from_le_bytes(val_bytes.try_into().unwrap());
+    assert_eq!(fill_val, -999);
+    assert_eq!(ds.read_raw().unwrap(), data);
+}
+
+#[test]
+fn roundtrip_compound_dataset() {
+    let dt = crate::Datatype::Compound {
+        size: 12,
+        members: vec![
+            crate::datatype::CompoundMember {
+                name: "id".to_string(),
+                byte_offset: 0,
+                datatype: crate::Datatype::native_i32(),
+            },
+            crate::datatype::CompoundMember {
+                name: "x".to_string(),
+                byte_offset: 4,
+                datatype: crate::Datatype::native_f32(),
+            },
+            crate::datatype::CompoundMember {
+                name: "y".to_string(),
+                byte_offset: 8,
+                datatype: crate::Datatype::native_f32(),
+            },
+        ],
+    };
+    let mut data = Vec::new();
+    for i in 0..3 {
+        data.extend_from_slice(&((i + 1) as i32).to_le_bytes());
+        data.extend_from_slice(&((2 * i + 1) as f32).to_le_bytes());
+        data.extend_from_slice(&((2 * i + 2) as f32).to_le_bytes());
+    }
+    let mut w = FileWriter::new();
+    w.root_mut().add_dataset("points", dt, &[3], data.clone());
+    let bytes = w.to_bytes().unwrap();
+
+    let file = File::from_bytes(bytes.into_boxed_slice()).unwrap();
+    let ds = file.root_group().unwrap().dataset("points").unwrap();
+    assert_eq!(ds.read_raw().unwrap(), data);
+    match ds.datatype().unwrap() {
+        crate::Datatype::Compound { size, members } => {
+            assert_eq!(size, 12);
+            assert_eq!(members.len(), 3);
+        }
+        _ => panic!("expected Compound"),
+    }
+}
+
+#[test]
+fn roundtrip_enum_dataset() {
+    let dt = crate::Datatype::Enum {
+        base: Box::new(crate::Datatype::native_i8()),
+        members: vec![
+            crate::datatype::EnumMember {
+                name: "RED".to_string(),
+                value: vec![0],
+            },
+            crate::datatype::EnumMember {
+                name: "GREEN".to_string(),
+                value: vec![1],
+            },
+            crate::datatype::EnumMember {
+                name: "BLUE".to_string(),
+                value: vec![2],
+            },
+        ],
+    };
+    let data = vec![0u8, 1, 2, 1, 0];
+    let mut w = FileWriter::new();
+    w.root_mut().add_dataset("colors", dt, &[5], data.clone());
+    let bytes = w.to_bytes().unwrap();
+
+    let file = File::from_bytes(bytes.into_boxed_slice()).unwrap();
+    let ds = file.root_group().unwrap().dataset("colors").unwrap();
+    assert_eq!(ds.read_raw().unwrap(), data);
+}
+
+#[test]
+fn roundtrip_array_dataset() {
+    let dt = crate::Datatype::Array {
+        element_type: Box::new(crate::Datatype::native_i32()),
+        dimensions: vec![3],
+    };
+    let data: Vec<u8> = (1..=12i32).flat_map(|x| x.to_le_bytes()).collect();
+    let mut w = FileWriter::new();
+    w.root_mut().add_dataset("vectors", dt, &[4], data.clone());
+    let bytes = w.to_bytes().unwrap();
+
+    let file = File::from_bytes(bytes.into_boxed_slice()).unwrap();
+    let ds = file.root_group().unwrap().dataset("vectors").unwrap();
+    assert_eq!(ds.read_raw().unwrap(), data);
+    assert_eq!(ds.shape().unwrap(), vec![4]);
+}
+
+#[test]
+fn roundtrip_complex_dataset() {
+    let dt = crate::Datatype::Complex {
+        size: 16,
+        base: Box::new(crate::Datatype::native_f64()),
+    };
+    let values: Vec<f64> = vec![1.0, 2.0, 3.0, 4.0, -1.0, 0.0, 0.0, -5.0];
+    let data: Vec<u8> = values.iter().flat_map(|x| x.to_le_bytes()).collect();
+    let mut w = FileWriter::new();
+    w.root_mut()
+        .add_dataset("complex_data", dt, &[4], data.clone());
+    let bytes = w.to_bytes().unwrap();
+
+    let file = File::from_bytes(bytes.into_boxed_slice()).unwrap();
+    let ds = file.root_group().unwrap().dataset("complex_data").unwrap();
+    assert_eq!(ds.read_raw().unwrap(), data);
+}
+
+#[test]
+fn roundtrip_big_endian_dataset() {
+    let dt = crate::Datatype::FixedPoint {
+        size: 4,
+        byte_order: ByteOrder::BigEndian,
+        signed: true,
+        bit_offset: 0,
+        bit_precision: 32,
+    };
+    let values: Vec<i32> = vec![1, 256, 65536, -1, 1000000, 0];
+    let data: Vec<u8> = values.iter().flat_map(|x| x.to_be_bytes()).collect();
+    let mut w = FileWriter::new();
+    w.root_mut().add_dataset("be_data", dt, &[6], data.clone());
+    let bytes = w.to_bytes().unwrap();
+
+    let file = File::from_bytes(bytes.into_boxed_slice()).unwrap();
+    let ds = file.root_group().unwrap().dataset("be_data").unwrap();
+    assert_eq!(ds.read_raw().unwrap(), data);
+
+    match ds.datatype().unwrap() {
+        crate::Datatype::FixedPoint { byte_order, .. } => {
+            assert_eq!(byte_order, ByteOrder::BigEndian);
+        }
+        _ => panic!("expected FixedPoint"),
+    }
+}
+
+#[test]
+fn h5dump_validates_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("h5dump_test.h5");
+
+    let mut w = FileWriter::new();
+    let root = w.root_mut();
+    let data: Vec<u8> = (0..10i32).flat_map(|x| x.to_le_bytes()).collect();
+    root.add_dataset("numbers", crate::Datatype::native_i32(), &[10], data);
+    let grp = root.add_group("metadata");
+    grp.add_attribute(
+        "version",
+        crate::Datatype::native_i32(),
+        &[],
+        1i32.to_le_bytes().to_vec(),
+    );
+    w.write_to_file(&path).unwrap();
+
+    if let Ok(output) = std::process::Command::new("h5dump")
+        .arg("-H")
+        .arg(&path)
+        .output()
+    {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "h5dump failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(stdout.contains("numbers"));
+        assert!(stdout.contains("metadata"));
+    }
+}
+
+#[test]
+fn write_to_file_roundtrip() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test.h5");
+
+    let mut w = FileWriter::new();
+    let data: Vec<u8> = (0..3i32).flat_map(|x| x.to_le_bytes()).collect();
+    w.root_mut()
+        .add_dataset("vals", crate::Datatype::native_i32(), &[3], data.clone());
+    w.write_to_file(&path).unwrap();
+
+    let file = crate::File::open(&path).unwrap();
+    let ds = file.root_group().unwrap().dataset("vals").unwrap();
+    assert_eq!(ds.read_raw().unwrap(), data);
+}
