@@ -67,6 +67,35 @@ impl GroupNode {
         }
     }
 
+    /// Add a committed (named) datatype to this group.
+    pub fn commit_datatype(&mut self, name: &str, datatype: Datatype) {
+        self.children.push((
+            name.to_string(),
+            ChildNode::CommittedDatatype(datatype),
+        ));
+    }
+
+    /// Add a dataset that references a committed (named) datatype.
+    ///
+    /// The `committed_type_name` must match the name of a previously committed
+    /// datatype in the same group.
+    pub fn add_dataset_committed(
+        &mut self,
+        name: &str,
+        committed_type_name: &str,
+        datatype: Datatype,
+        shape: &[u64],
+        data: Vec<u8>,
+    ) -> &mut DatasetNode {
+        let mut ds = DatasetNode::new(datatype, shape, data);
+        ds.committed_type_name = Some(committed_type_name.to_string());
+        self.children.push((name.to_string(), ChildNode::Dataset(ds)));
+        match &mut self.children.last_mut().unwrap().1 {
+            ChildNode::Dataset(d) => d,
+            _ => unreachable!(),
+        }
+    }
+
     /// Add an attribute to this group.
     pub fn add_attribute(
         &mut self,
@@ -80,6 +109,7 @@ impl GroupNode {
             datatype,
             shape: shape.to_vec(),
             value,
+            committed_type_name: None,
         });
         self
     }

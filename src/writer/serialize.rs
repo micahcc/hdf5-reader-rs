@@ -44,6 +44,11 @@ pub(crate) fn write_group(
         let addr = match child {
             ChildNode::Group(g) => write_group(g, buf, opts)?,
             ChildNode::Dataset(d) => write_dataset(d, buf, opts)?,
+            ChildNode::CommittedDatatype(_) => {
+                return Err(crate::error::Error::Other {
+                    msg: "committed datatypes not supported in non-compat serializer".into(),
+                });
+            }
         };
         child_addrs.push((name, addr));
     }

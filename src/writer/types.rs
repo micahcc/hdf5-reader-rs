@@ -44,6 +44,7 @@ pub enum SpaceAllocTime {
 pub(crate) enum ChildNode {
     Group(GroupNode),
     Dataset(DatasetNode),
+    CommittedDatatype(Datatype),
 }
 
 pub(crate) struct AttrData {
@@ -51,4 +52,6 @@ pub(crate) struct AttrData {
     pub datatype: Datatype,
     pub shape: Vec<u64>,
     pub value: Vec<u8>,
+    /// If set, this attribute references a committed (named) datatype.
+    pub committed_type_name: Option<String>,
 }

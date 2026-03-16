@@ -1068,7 +1068,6 @@ fn compat_empty_chunked() {
 }
 
 #[test]
-#[cfg(feature = "system-zlib")]
 fn compat_fletcher32() {
     let mut w = FileWriter::with_options(compat_opts_v3());
     let vals: Vec<u8> = (1..=10i32).map(|x| x * 100).flat_map(|x| x.to_le_bytes()).collect();
@@ -1247,6 +1246,24 @@ fn compat_btree_v2_filtered() {
 }
 
 #[test]
+fn compat_vlen_sequence() {
+    let mut w = FileWriter::with_options(compat_opts_v3());
+    let dt = crate::Datatype::VarLen {
+        element_type: Box::new(crate::Datatype::native_i32()),
+        is_string: false,
+        padding: None,
+        char_set: None,
+    };
+    let elements: Vec<Vec<u8>> = vec![
+        vec![10i32, 20].iter().flat_map(|x| x.to_le_bytes()).collect(),
+        vec![100i32, 200, 300, 400].iter().flat_map(|x| x.to_le_bytes()).collect(),
+        vec![42i32].iter().flat_map(|x| x.to_le_bytes()).collect(),
+    ];
+    w.root_mut().add_vlen_dataset("sequences", dt, &[3], elements);
+    assert_bytes_match(&w.to_bytes().unwrap(), "tests/fixtures/vlen_sequence.h5");
+}
+
+#[test]
 fn compat_btree_v2_deep() {
     let mut w = FileWriter::with_options(compat_opts_v3());
     // 20×10, chunk 1×1, 200 chunks → depth-1 BTree v2
@@ -1279,4 +1296,53 @@ fn compat_vlen_strings() {
     ];
     w.root_mut().add_vlen_dataset("names", dt, &[4], elements);
     assert_bytes_match(&w.to_bytes().unwrap(), "tests/fixtures/vlen_strings.h5");
+}
+
+#[test]
+fn compat_committed_datatype() {
+    let mut w = FileWriter::with_options(compat_opts_v3());
+    let dt = crate::Datatype::native_i32();
+
+    w.root_mut().commit_datatype("mytype", dt.clone());
+
+    let vals1: Vec<u8> = [10i32, 20, 30, 40, 50]
+        .iter()
+        .flat_map(|x| x.to_le_bytes())
+        .collect();
+    w.root_mut()
+        .add_dataset_committed("data1", "mytype", dt.clone(), &[5], vals1);
+
+    let vals2: Vec<u8> = [100i32, 200, 300, 400, 500]
+        .iter()
+        .flat_map(|x| x.to_le_bytes())
+        .collect();
+    w.root_mut()
+        .add_dataset_committed("data2", "mytype", dt, &[5], vals2);
+
+    assert_bytes_match(
+        &w.to_bytes().unwrap(),
+        "tests/fixtures/committed_datatype.h5",
+    );
+}
+
+#[test]
+fn compat_shared_attr() {
+    let mut w = FileWriter::with_options(compat_opts_v3());
+    let dt = crate::Datatype::native_i32();
+
+    w.root_mut().commit_datatype("shared_i32", dt.clone());
+
+    let vals: Vec<u8> = [11i32, 22, 33]
+        .iter()
+        .flat_map(|x| x.to_le_bytes())
+        .collect();
+    let ds = w
+        .root_mut()
+        .add_dataset_committed("data", "shared_i32", dt.clone(), &[3], vals);
+
+    // Add attribute "scale" using the same committed type (scalar, value=42).
+    let scale_val: Vec<u8> = 42i32.to_le_bytes().to_vec();
+    ds.add_attribute_committed("scale", "shared_i32", dt, &[], scale_val);
+
+    assert_bytes_match(&w.to_bytes().unwrap(), "tests/fixtures/shared_attr.h5");
 }

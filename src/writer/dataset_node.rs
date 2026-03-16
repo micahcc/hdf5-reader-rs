@@ -18,6 +18,8 @@ pub struct DatasetNode {
     pub(crate) vlen_elements: Option<Vec<Vec<u8>>>,
     /// When true, use early space allocation (affects fill value flags and chunk index type).
     pub(crate) early_alloc: bool,
+    /// If set, the dataset references a committed (named) datatype by name.
+    pub(crate) committed_type_name: Option<String>,
 }
 
 impl DatasetNode {
@@ -33,6 +35,7 @@ impl DatasetNode {
             layout_version: 4,
             vlen_elements: None,
             early_alloc: false,
+            committed_type_name: None,
         }
     }
 
@@ -48,6 +51,7 @@ impl DatasetNode {
             layout_version: 4,
             vlen_elements: Some(elements),
             early_alloc: false,
+            committed_type_name: None,
         }
     }
 
@@ -64,6 +68,26 @@ impl DatasetNode {
             datatype,
             shape: shape.to_vec(),
             value,
+            committed_type_name: None,
+        });
+        self
+    }
+
+    /// Add an attribute that references a committed (named) datatype.
+    pub fn add_attribute_committed(
+        &mut self,
+        name: &str,
+        committed_type_name: &str,
+        datatype: Datatype,
+        shape: &[u64],
+        value: Vec<u8>,
+    ) -> &mut Self {
+        self.attributes.push(AttrData {
+            name: name.to_string(),
+            datatype,
+            shape: shape.to_vec(),
+            value,
+            committed_type_name: Some(committed_type_name.to_string()),
         });
         self
     }

@@ -11,6 +11,7 @@ use crate::writer::encode::compat_dataset_chunk_size;
 use crate::writer::encode::compat_group_chunk_size;
 use crate::writer::encode::encode_attribute;
 use crate::writer::encode::encode_attribute_info;
+use crate::writer::encode::encode_attribute_shared;
 use crate::writer::encode::encode_chunked_layout;
 use crate::writer::encode::encode_chunked_layout_v3;
 use crate::writer::encode::encode_compact_layout;
@@ -140,7 +141,14 @@ pub(crate) fn write_tree_compat(
                     } else {
                         (0..vlen_elems.len()).collect()
                     };
-                    let heap_ids = build_vlen_heap_ids_compat(vlen_elems, gcol_addr, &gcol_order);
+                    let base_elem_size = match &d.datatype {
+                        crate::datatype::Datatype::VarLen { element_type, .. } =>
+                            element_type.element_size() as usize,
+                        _ => 1,
+                    };
+                    let heap_ids = build_vlen_heap_ids_compat(
+                        vlen_elems, gcol_addr, &gcol_order, base_elem_size,
+                    );
                     buf[ds..ds + heap_ids.len()].copy_from_slice(&heap_ids);
                     // GCOL bytes are already in data[heap_id_bytes..]
                     buf[ds + heap_id_bytes..ds + data.len()]
@@ -231,6 +239,8 @@ struct ObjectInfo {
 enum ObjectKind {
     Group(GroupRef),
     Dataset(DatasetRef),
+    CommittedDatatype(CommittedTypeRef),
+    Continuation(ContinuationRef),
 }
 
 struct GroupRef {
@@ -248,6 +258,21 @@ struct DatasetRef {
     compact_data: Option<Vec<u8>>,
     /// Chunked layout info (if layout is chunked).
     chunked_info: Option<ChunkedInfo>,
+    /// If set, this dataset references a committed type at this object index.
+    committed_type_index: Option<usize>,
+    /// Map of committed type names to object indices for attribute shared type refs.
+    attr_committed_types: std::collections::HashMap<String, usize>,
+}
+
+struct CommittedTypeRef {
+    datatype: crate::datatype::Datatype,
+    /// Object index of the OCHK continuation block.
+    ochk_index: Option<usize>,
+}
+
+struct ContinuationRef {
+    datatype: crate::datatype::Datatype,
+    refcount: u32,
 }
 
 struct ChunkedInfo {
@@ -295,12 +320,64 @@ fn flatten_tree(
         btree_v2_num_nodes: 0,
     });
 
+    // Pre-count committed type references for refcount message.
+    // Base refcount starts at 1 (for the commit itself). Each dataset or attribute
+    // that references the committed type adds 1.
+    let mut ct_refcounts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    for (_, child) in &group.children {
+        if let ChildNode::Dataset(d) = child {
+            if let Some(ref ct_name) = d.committed_type_name {
+                *ct_refcounts.entry(ct_name.clone()).or_insert(1) += 1;
+            }
+            // Count attributes that reference committed types.
+            for attr in &d.attributes {
+                if let Some(ref ct_name) = attr.committed_type_name {
+                    *ct_refcounts.entry(ct_name.clone()).or_insert(1) += 1;
+                }
+            }
+        }
+    }
+
     // Recursively flatten children.
     let mut child_indices = Vec::new();
+    let mut committed_types: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut ochk_placed: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (name, child) in &group.children {
         let child_idx = match child {
             ChildNode::Group(g) => flatten_tree(g, opts, objects)?,
-            ChildNode::Dataset(d) => flatten_dataset(d, opts, objects)?,
+            ChildNode::Dataset(d) => {
+                let ct_index = d
+                    .committed_type_name
+                    .as_ref()
+                    .and_then(|n| committed_types.get(n).copied());
+                let ds_idx = flatten_dataset(d, opts, objects, ct_index, &committed_types)?;
+                // Place OCHK after the first dataset referencing a committed type.
+                if let Some(ref ct_name) = d.committed_type_name {
+                    if !ochk_placed.contains(ct_name) {
+                        if let Some(&ct_obj_idx) = committed_types.get(ct_name) {
+                            let refcount = ct_refcounts.get(ct_name).copied().unwrap_or(1);
+                            let dt = match &objects[ct_obj_idx].kind {
+                                ObjectKind::CommittedDatatype(ct) => ct.datatype.clone(),
+                                _ => unreachable!(),
+                            };
+                            let ochk_idx = flatten_ochk(&dt, refcount, objects)?;
+                            if let ObjectKind::CommittedDatatype(ref mut ct) =
+                                objects[ct_obj_idx].kind
+                            {
+                                ct.ochk_index = Some(ochk_idx);
+                            }
+                            ochk_placed.insert(ct_name.clone());
+                        }
+                    }
+                }
+                ds_idx
+            }
+            ChildNode::CommittedDatatype(dt) => {
+                let ct_idx = flatten_committed_type(dt, opts, objects)?;
+                committed_types.insert(name.clone(), ct_idx);
+                ct_idx
+            }
         };
         child_indices.push((name.clone(), child_idx));
     }
@@ -328,6 +405,8 @@ fn flatten_dataset(
     ds: &DatasetNode,
     opts: &WriteOptions,
     objects: &mut Vec<ObjectInfo>,
+    committed_type_index: Option<usize>,
+    committed_types: &std::collections::HashMap<String, usize>,
 ) -> Result<usize> {
     let idx = objects.len();
 
@@ -380,7 +459,12 @@ fn flatten_dataset(
         let chunk_for_overhead = tc.unwrap_or(real_msg_bytes);
         (tc, ohdr_overhead(chunk_for_overhead, opts))
     } else {
-        let messages = build_dataset_messages_dummy(ds, opts, 0xDEAD_BEEF_0000_0000)?;
+        let messages = build_dataset_messages_dummy(
+            ds,
+            opts,
+            0xDEAD_BEEF_0000_0000,
+            committed_type_index.is_some(),
+        )?;
         let real_msg_bytes: usize = messages.iter().map(|(_, b, _)| 4 + b.len()).sum();
         let target = compat_dataset_chunk_size(real_msg_bytes);
         let tc = if target > real_msg_bytes {
@@ -398,6 +482,16 @@ fn flatten_dataset(
         .map(|ci| compute_index_meta_size(ci))
         .unwrap_or(0);
 
+    // Build map of committed type names → object indices for shared-type attributes.
+    let mut attr_ct_map = std::collections::HashMap::new();
+    for attr in &ds.attributes {
+        if let Some(ref ct_name) = attr.committed_type_name {
+            if let Some(&ct_idx) = committed_types.get(ct_name) {
+                attr_ct_map.insert(ct_name.clone(), ct_idx);
+            }
+        }
+    }
+
     objects.push(ObjectInfo {
         kind: ObjectKind::Dataset(DatasetRef {
             datatype: ds.datatype.clone(),
@@ -412,6 +506,8 @@ fn flatten_dataset(
                 None
             },
             chunked_info,
+            committed_type_index,
+            attr_committed_types: attr_ct_map,
         }),
         ohdr_size,
         meta_addr: 0,
@@ -420,6 +516,68 @@ fn flatten_dataset(
         child_indices: vec![],
         target_chunk_size: target_chunk,
         index_meta_size,
+        btree_v2_nodes_start: UNDEF_ADDR,
+        btree_v2_num_nodes: 0,
+    });
+
+    Ok(idx)
+}
+
+fn flatten_committed_type(
+    dt: &crate::datatype::Datatype,
+    opts: &WriteOptions,
+    objects: &mut Vec<ObjectInfo>,
+) -> Result<usize> {
+    let idx = objects.len();
+
+    // Committed type OHDR: continuation message (20 bytes) + gap in a small chunk.
+    // The C library allocates a chunk sized for the datatype msg + 6 bytes extra.
+    let dt_bytes = encode_datatype(dt)?;
+    let committed_chunk_size = (4 + dt_bytes.len()) + 6;
+    let ohdr_size = ohdr_overhead(committed_chunk_size, opts);
+
+    objects.push(ObjectInfo {
+        kind: ObjectKind::CommittedDatatype(CommittedTypeRef {
+            datatype: dt.clone(),
+            ochk_index: None,
+        }),
+        ohdr_size,
+        meta_addr: 0,
+        data: vec![],
+        data_addr: 0,
+        child_indices: vec![],
+        target_chunk_size: Some(committed_chunk_size),
+        index_meta_size: 0,
+        btree_v2_nodes_start: UNDEF_ADDR,
+        btree_v2_num_nodes: 0,
+    });
+
+    Ok(idx)
+}
+
+fn flatten_ochk(
+    dt: &crate::datatype::Datatype,
+    refcount: u32,
+    objects: &mut Vec<ObjectInfo>,
+) -> Result<usize> {
+    let idx = objects.len();
+
+    let dt_bytes = encode_datatype(dt)?;
+    // OCHK: sig(4) + dt_msg(4+dt_size) + refcount_msg(4+5) + checksum(4)
+    let ochk_size = 4 + (4 + dt_bytes.len()) + (4 + 5) + 4;
+
+    objects.push(ObjectInfo {
+        kind: ObjectKind::Continuation(ContinuationRef {
+            datatype: dt.clone(),
+            refcount,
+        }),
+        ohdr_size: ochk_size,
+        meta_addr: 0,
+        data: vec![],
+        data_addr: 0,
+        child_indices: vec![],
+        target_chunk_size: None,
+        index_meta_size: 0,
         btree_v2_nodes_start: UNDEF_ADDR,
         btree_v2_num_nodes: 0,
     });
@@ -565,7 +723,17 @@ fn encode_object_final(
         ObjectKind::Dataset(d) => {
             use crate::writer::types::SpaceAllocTime;
 
-            let dt_body = encode_datatype(&d.datatype)?;
+            // Datatype: shared reference if committed, else inline.
+            let (dt_body, dt_flags) = if let Some(ct_idx) = d.committed_type_index {
+                let ct_addr = objects[ct_idx].meta_addr;
+                let mut body = Vec::with_capacity(10);
+                body.push(2); // shared message version
+                body.push(2); // type = object in file by address
+                body.extend_from_slice(&ct_addr.to_le_bytes());
+                (body, 0x03u8) // constant + shared
+            } else {
+                (encode_datatype(&d.datatype)?, 0x01u8)
+            };
 
             // Always include max_dims in compat mode.
             let effective_max = Some(d.max_dims.clone().unwrap_or_else(|| d.shape.clone()));
@@ -641,15 +809,23 @@ fn encode_object_final(
                 )
             };
 
-            let attr_bodies: Vec<Vec<u8>> = d
-                .attributes
-                .iter()
-                .map(encode_attribute)
-                .collect::<Result<Vec<_>>>()?;
+            let mut attr_bodies: Vec<Vec<u8>> = Vec::new();
+            for attr in &d.attributes {
+                if let Some(ref ct_name) = attr.committed_type_name {
+                    if let Some(&ct_idx) = d.attr_committed_types.get(ct_name) {
+                        let ct_addr = objects[ct_idx].meta_addr;
+                        attr_bodies.push(encode_attribute_shared(attr, ct_addr)?);
+                    } else {
+                        attr_bodies.push(encode_attribute(attr)?);
+                    }
+                } else {
+                    attr_bodies.push(encode_attribute(attr)?);
+                }
+            }
 
             let mut messages: Vec<OhdrMsg> = vec![
                 (MessageType::Dataspace.as_u8(), ds_body, 0),
-                (MessageType::Datatype.as_u8(), dt_body, 0x01),
+                (MessageType::Datatype.as_u8(), dt_body, dt_flags),
                 (MessageType::FillValue.as_u8(), fv_body, 0x01),
             ];
             if let Some(fb) = filter_body {
@@ -674,6 +850,51 @@ fn encode_object_final(
             }
 
             encode_object_header(&messages, opts, target_chunk)
+        }
+        ObjectKind::CommittedDatatype(ct) => {
+            // OHDR with a continuation message pointing to the OCHK.
+            let ochk_addr = ct
+                .ochk_index
+                .map(|i| objects[i].meta_addr)
+                .unwrap_or(UNDEF_ADDR);
+            let ochk_size = ct
+                .ochk_index
+                .map(|i| objects[i].ohdr_size as u64)
+                .unwrap_or(0);
+
+            let mut cont_body = Vec::with_capacity(16);
+            cont_body.extend_from_slice(&ochk_addr.to_le_bytes());
+            cont_body.extend_from_slice(&ochk_size.to_le_bytes());
+
+            let messages: Vec<OhdrMsg> =
+                vec![(MessageType::ObjectHeaderContinuation.as_u8(), cont_body, 0x00)];
+
+            encode_object_header(&messages, opts, target_chunk)
+        }
+        ObjectKind::Continuation(cont) => {
+            // OCHK: sig(4) + datatype_msg + refcount_msg + checksum(4)
+            let dt_bytes = encode_datatype(&cont.datatype)?;
+
+            let mut buf = Vec::new();
+            buf.extend_from_slice(b"OCHK");
+
+            // Datatype message: type=0x03, flags=0x05 (constant + not-shareable)
+            buf.push(MessageType::Datatype.as_u8());
+            buf.extend_from_slice(&(dt_bytes.len() as u16).to_le_bytes());
+            buf.push(0x05);
+            buf.extend_from_slice(&dt_bytes);
+
+            // Object Reference Count message: type=0x16, flags=0x04 (not-shareable)
+            buf.push(0x16);
+            buf.extend_from_slice(&5u16.to_le_bytes());
+            buf.push(0x04);
+            buf.push(0x00); // version
+            buf.extend_from_slice(&cont.refcount.to_le_bytes());
+
+            let cs = crate::checksum::lookup3(&buf);
+            buf.extend_from_slice(&cs.to_le_bytes());
+
+            Ok(buf)
         }
     }
 }
@@ -806,8 +1027,14 @@ fn build_dataset_messages_dummy(
     ds: &DatasetNode,
     _opts: &WriteOptions,
     dummy_data_addr: u64,
+    shared_type: bool,
 ) -> Result<Vec<OhdrMsg>> {
-    let dt_body = encode_datatype(&ds.datatype)?;
+    let (dt_body, dt_flags) = if shared_type {
+        // Shared type reference: version(1) + type(1) + addr(8) = 10 bytes
+        (vec![0u8; 10], 0x03u8)
+    } else {
+        (encode_datatype(&ds.datatype)?, 0x01u8)
+    };
 
     // Always include max_dims in compat mode.
     let effective_max = Some(ds.max_dims.clone().unwrap_or_else(|| ds.shape.clone()));
@@ -817,15 +1044,20 @@ fn build_dataset_messages_dummy(
     let data_size = ds.data.len() as u64;
     let layout_body = encode_contiguous_layout(dummy_data_addr, data_size);
 
-    let attr_bodies: Vec<Vec<u8>> = ds
-        .attributes
-        .iter()
-        .map(encode_attribute)
-        .collect::<Result<Vec<_>>>()?;
+    // Encode attributes, using shared references for committed-type attrs.
+    let mut attr_bodies: Vec<Vec<u8>> = Vec::new();
+    for attr in &ds.attributes {
+        if attr.committed_type_name.is_some() {
+            // Use a dummy address; body size is the same regardless of address.
+            attr_bodies.push(encode_attribute_shared(attr, 0xDEAD_0000)?);
+        } else {
+            attr_bodies.push(encode_attribute(attr)?);
+        }
+    }
 
     let mut messages: Vec<OhdrMsg> = vec![
         (MessageType::Dataspace.as_u8(), ds_body, 0),
-        (MessageType::Datatype.as_u8(), dt_body, 0x01),
+        (MessageType::Datatype.as_u8(), dt_body, dt_flags),
         (MessageType::FillValue.as_u8(), fv_body, 0x01),
         (MessageType::DataLayout.as_u8(), layout_body, 0),
     ];
@@ -1888,6 +2120,7 @@ fn build_vlen_heap_ids_compat(
     elements: &[Vec<u8>],
     gcol_addr: u64,
     gcol_order: &[usize],
+    base_elem_size: usize,
 ) -> Vec<u8> {
     // Build a mapping: original_element_index → gcol_object_index (1-based)
     let mut elem_to_gcol_idx = vec![0u32; elements.len()];
@@ -1903,7 +2136,9 @@ fn build_vlen_heap_ids_compat(
             buf.extend_from_slice(&UNDEF_ADDR.to_le_bytes());
             buf.extend_from_slice(&0u32.to_le_bytes());
         } else {
-            buf.extend_from_slice(&(elem.len() as u32).to_le_bytes());
+            // seq_len is the element count (bytes / base_element_size)
+            let seq_len = (elem.len() / base_elem_size) as u32;
+            buf.extend_from_slice(&seq_len.to_le_bytes());
             buf.extend_from_slice(&gcol_addr.to_le_bytes());
             buf.extend_from_slice(&elem_to_gcol_idx[i].to_le_bytes());
         }
@@ -1917,5 +2152,6 @@ fn clone_attr(attr: &crate::writer::types::AttrData) -> crate::writer::types::At
         datatype: attr.datatype.clone(),
         shape: attr.shape.clone(),
         value: attr.value.clone(),
+        committed_type_name: attr.committed_type_name.clone(),
     }
 }

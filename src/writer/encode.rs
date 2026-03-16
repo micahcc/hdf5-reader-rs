@@ -86,18 +86,18 @@ pub(crate) fn encode_object_header(
         buf.extend_from_slice(body);
     }
 
-    // Pad with NIL message if needed
+    // Pad with NIL message or gap if needed
     let nil_bytes = total_msg_bytes - real_msg_bytes;
-    if nil_bytes > 0 {
-        assert!(
-            nil_bytes >= 4,
-            "NIL padding must be at least 4 bytes (header)"
-        );
+    if nil_bytes >= 4 {
+        // Full NIL message: header(4) + body
         let nil_body_len = nil_bytes - 4;
         buf.push(0x00); // NIL type
         buf.extend_from_slice(&(nil_body_len as u16).to_le_bytes());
         buf.push(0x00); // NIL flags
         buf.resize(buf.len() + nil_body_len, 0);
+    } else if nil_bytes > 0 {
+        // Small gap (1-3 bytes): just zero-fill per v2 OHDR spec
+        buf.resize(buf.len() + nil_bytes, 0);
     }
 
     let cksum = checksum::lookup3(&buf);
@@ -591,6 +591,33 @@ pub(crate) fn encode_attribute(attr: &AttrData) -> Result<Vec<u8>> {
     buf.extend_from_slice(&(dt_enc.len() as u16).to_le_bytes());
     buf.extend_from_slice(&(ds_enc.len() as u16).to_le_bytes());
     buf.push(0);
+    buf.extend_from_slice(attr.name.as_bytes());
+    buf.push(0);
+    buf.extend_from_slice(&dt_enc);
+    buf.extend_from_slice(&ds_enc);
+    buf.extend_from_slice(&attr.value);
+
+    Ok(buf)
+}
+
+/// Encode an attribute whose datatype is a shared reference to a committed type.
+pub(crate) fn encode_attribute_shared(attr: &AttrData, committed_type_addr: u64) -> Result<Vec<u8>> {
+    // Shared type reference: version(1)=2 + type(1)=2 + addr(8) = 10 bytes
+    let mut dt_enc = Vec::with_capacity(10);
+    dt_enc.push(2);
+    dt_enc.push(2);
+    dt_enc.extend_from_slice(&committed_type_addr.to_le_bytes());
+
+    let ds_enc = encode_dataspace(&attr.shape, None);
+    let name_with_nul = attr.name.len() + 1;
+
+    let mut buf = Vec::new();
+    buf.push(3);
+    buf.push(0x01); // flags: bit 0 = datatype is shared
+    buf.extend_from_slice(&(name_with_nul as u16).to_le_bytes());
+    buf.extend_from_slice(&(dt_enc.len() as u16).to_le_bytes());
+    buf.extend_from_slice(&(ds_enc.len() as u16).to_le_bytes());
+    buf.push(0); // encoding = ASCII
     buf.extend_from_slice(attr.name.as_bytes());
     buf.push(0);
     buf.extend_from_slice(&dt_enc);
