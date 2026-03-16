@@ -66,6 +66,17 @@ pub(crate) fn write_tree_compat(
             obj.data_addr = data_pos as u64;
             data_pos += obj.data.len();
         }
+        // BTreeV2: place leaf node after chunk data, aligned to meta_block_size.
+        if let ObjectKind::Dataset(ref d) = obj.kind {
+            if let Some(ref ci) = d.chunked_info {
+                if ci.index_type_id == 5 && !ci.chunk_data_parts.is_empty() {
+                    let leaf_addr = align_up(data_pos, meta_block_size);
+                    let node_size = 2048;
+                    obj.btree_leaf_addr = leaf_addr as u64;
+                    data_pos = leaf_addr + node_size;
+                }
+            }
+        }
     }
 
     let eof = data_pos;
@@ -98,7 +109,7 @@ pub(crate) fn write_tree_compat(
                 if let Some(ref ci) = d.chunked_info {
                     let index_addr = meta_addr + objects[i].ohdr_size as u64;
                     let index_bytes =
-                        encode_chunk_index(ci, index_addr, data_addr)?;
+                        encode_chunk_index(ci, index_addr, data_addr, objects[i].btree_leaf_addr)?;
                     let istart = index_addr as usize;
                     buf[istart..istart + index_bytes.len()]
                         .copy_from_slice(&index_bytes);
@@ -106,10 +117,73 @@ pub(crate) fn write_tree_compat(
             }
         }
 
-        // Write data block.
+        // Write data block (with vlen heap ID fixup if needed).
         if !data.is_empty() {
             let ds = data_addr as usize;
-            buf[ds..ds + data.len()].copy_from_slice(&data);
+            if let ObjectKind::Dataset(ref d) = objects[i].kind {
+                if let Some(ref vlen_elems) = d.vlen_elements {
+                    // Rewrite the heap IDs with correct GCOL address.
+                    let heap_id_bytes = vlen_elems.len() * 16;
+                    let gcol_addr = data_addr + heap_id_bytes as u64;
+                    let is_string = matches!(d.datatype,
+                        crate::datatype::Datatype::VarLen { is_string: true, .. });
+                    let gcol_order = if is_string {
+                        vlen_string_gcol_order(vlen_elems.len())
+                    } else {
+                        (0..vlen_elems.len()).collect()
+                    };
+                    let heap_ids = build_vlen_heap_ids_compat(vlen_elems, gcol_addr, &gcol_order);
+                    buf[ds..ds + heap_ids.len()].copy_from_slice(&heap_ids);
+                    // GCOL bytes are already in data[heap_id_bytes..]
+                    buf[ds + heap_id_bytes..ds + data.len()]
+                        .copy_from_slice(&data[heap_id_bytes..]);
+                } else {
+                    buf[ds..ds + data.len()].copy_from_slice(&data);
+                }
+            } else {
+                buf[ds..ds + data.len()].copy_from_slice(&data);
+            }
+        }
+
+        // Write BTreeV2 leaf node if applicable.
+        if objects[i].btree_leaf_addr != UNDEF_ADDR {
+            if let ObjectKind::Dataset(ref d) = objects[i].kind {
+                if let Some(ref ci) = d.chunked_info {
+                    if ci.index_type_id == 5 {
+                        // Compute per-chunk addresses.
+                        let mut chunk_addrs = Vec::new();
+                        let mut offset = 0u64;
+                        for part in &ci.chunk_data_parts {
+                            chunk_addrs.push(data_addr + offset);
+                            offset += part.len() as u64;
+                        }
+                        let unfilt_chunk_bytes: u64 =
+                            ci.chunk_dims_with_elem.iter().product();
+                        let has_filters = !ci.filters.is_empty();
+                        let (btree_type, _rec_size, chunk_size_len) =
+                            btree_v2_record_info(ci.ndims, has_filters, unfilt_chunk_bytes);
+                        let mut filt_sizes: Vec<u64> = ci
+                            .chunk_data_parts
+                            .iter()
+                            .map(|p| p.len() as u64)
+                            .collect();
+                        if filt_sizes.is_empty() {
+                            filt_sizes = vec![0; chunk_addrs.len()];
+                        }
+                        let leaf = encode_btree_v2_leaf(
+                            &chunk_addrs,
+                            &ci.chunk_coords,
+                            &filt_sizes,
+                            ci.ndims,
+                            btree_type,
+                            chunk_size_len,
+                            2048,
+                        );
+                        let leaf_start = objects[i].btree_leaf_addr as usize;
+                        buf[leaf_start..leaf_start + leaf.len()].copy_from_slice(&leaf);
+                    }
+                }
+            }
         }
     }
 
@@ -134,6 +208,8 @@ struct ObjectInfo {
     target_chunk_size: Option<usize>,
     /// Size of chunk index metadata (FixedArray/ExtArray header+dblk) placed after OHDR.
     index_meta_size: usize,
+    /// For BTreeV2: address of the leaf node (placed after chunk data).
+    btree_leaf_addr: u64,
 }
 
 enum ObjectKind {
@@ -176,6 +252,8 @@ struct ChunkedInfo {
     chunk_coords: Vec<Vec<u64>>,
     /// Dataset shape (for BTree v1 sentinel key).
     dataset_shape: Vec<u64>,
+    /// Number of spatial dimensions (for BTree v2 records).
+    ndims: usize,
 }
 
 fn flatten_tree(
@@ -197,6 +275,7 @@ fn flatten_tree(
         child_indices: vec![],
         target_chunk_size: None,
         index_meta_size: 0,
+        btree_leaf_addr: UNDEF_ADDR,
     });
 
     // Recursively flatten children.
@@ -243,8 +322,22 @@ fn flatten_dataset(
         flatten_chunked_data(ds, opts)?
     } else if is_compact {
         (vec![], None)
-    } else if ds.vlen_elements.is_some() {
-        (vec![], None)
+    } else if let Some(ref vlen_elems) = ds.vlen_elements {
+        // Determine GCOL ordering based on vlen type.
+        let is_string = matches!(ds.datatype,
+            crate::datatype::Datatype::VarLen { is_string: true, .. });
+        let gcol_order = if is_string {
+            vlen_string_gcol_order(vlen_elems.len())
+        } else {
+            (0..vlen_elems.len()).collect()
+        };
+        let ordered_refs: Vec<&Vec<u8>> = gcol_order.iter().map(|&i| &vlen_elems[i]).collect();
+        let gcol_bytes = build_gcol_compat(&ordered_refs);
+        let heap_id_bytes = vlen_elems.len() * 16;
+        // Placeholder: heap_ids (will be rewritten in phase 4) + gcol
+        let mut blob = vec![0u8; heap_id_bytes];
+        blob.extend_from_slice(&gcol_bytes);
+        (blob, None)
     } else {
         (ds.data.clone(), None)
     };
@@ -310,6 +403,7 @@ fn flatten_dataset(
         child_indices: vec![],
         target_chunk_size: target_chunk,
         index_meta_size,
+        btree_leaf_addr: UNDEF_ADDR,
     });
 
     Ok(idx)
@@ -371,6 +465,7 @@ fn flatten_chunked_data(
                 layout_version: ds.layout_version,
                 chunk_coords: vec![],
                 dataset_shape: ds.shape.clone(),
+                ndims: ds.shape.len(),
             }),
         ));
     }
@@ -417,6 +512,7 @@ fn flatten_chunked_data(
             layout_version: ds.layout_version,
             chunk_coords: chunk_coords_list,
             dataset_shape: ds.shape.clone(),
+            ndims: ds.shape.len(),
         }),
     ))
 }
@@ -458,18 +554,23 @@ fn encode_object_final(
             let ds_body = encode_dataspace(&d.shape, effective_max.as_deref());
 
             // Fill value allocation time depends on layout type.
-            let alloc_time = if d.compact_data.is_some() {
-                SpaceAllocTime::Early
-            } else if let Some(ref ci) = d.chunked_info {
-                if ci.early_alloc {
-                    SpaceAllocTime::Early
-                } else {
-                    SpaceAllocTime::Incremental
-                }
+            let fv_body = if d.vlen_elements.is_some() {
+                // Vlen datasets: alloc_time=late, fill_write_time=on_alloc (flags=0x02)
+                vec![3, 0x02]
             } else {
-                SpaceAllocTime::Late
+                let alloc_time = if d.compact_data.is_some() {
+                    SpaceAllocTime::Early
+                } else if let Some(ref ci) = d.chunked_info {
+                    if ci.early_alloc {
+                        SpaceAllocTime::Early
+                    } else {
+                        SpaceAllocTime::Incremental
+                    }
+                } else {
+                    SpaceAllocTime::Late
+                };
+                encode_fill_value_msg_alloc(&d.fill_value, alloc_time)
             };
-            let fv_body = encode_fill_value_msg_alloc(&d.fill_value, alloc_time);
 
             // Build layout message and optional filter pipeline.
             let (layout_body, filter_body) = if let Some(ref ci) = d.chunked_info {
@@ -504,15 +605,20 @@ fn encode_object_final(
             } else if let Some(ref compact_data) = d.compact_data {
                 (encode_compact_layout(compact_data), None)
             } else {
-                let data_addr = if obj.data.is_empty() && d.vlen_elements.is_none() {
-                    UNDEF_ADDR
-                } else if d.vlen_elements.is_some() {
-                    UNDEF_ADDR
+                let (data_addr, data_size) = if let Some(ref vlen_elems) = d.vlen_elements {
+                    if obj.data.is_empty() {
+                        (UNDEF_ADDR, 0u64)
+                    } else {
+                        let heap_id_bytes = (vlen_elems.len() * 16) as u64;
+                        (obj.data_addr, heap_id_bytes)
+                    }
+                } else if obj.data.is_empty() {
+                    (UNDEF_ADDR, 0u64)
                 } else {
-                    obj.data_addr
+                    (obj.data_addr, obj.data.len() as u64)
                 };
                 (
-                    encode_contiguous_layout(data_addr, obj.data.len() as u64),
+                    encode_contiguous_layout(data_addr, data_size),
                     None,
                 )
             };
@@ -723,6 +829,7 @@ fn encode_chunk_index(
     ci: &ChunkedInfo,
     index_addr: u64,
     data_addr: u64,
+    btree_leaf_addr: u64,
 ) -> Result<Vec<u8>> {
     // Compute per-chunk addresses within the data blob.
     let mut chunk_addrs = Vec::with_capacity(ci.chunk_data_parts.len());
@@ -753,7 +860,15 @@ fn encode_chunk_index(
             !ci.filters.is_empty(),
             &filtered_sizes,
         )),
-        _ => Ok(vec![]), // TODO: BTreeV2
+        5 => {
+            let unfilt_chunk_bytes: u64 = ci.chunk_dims_with_elem.iter().product();
+            let has_filters = !ci.filters.is_empty();
+            let (btree_type, rec_size, _csl) =
+                btree_v2_record_info(ci.ndims, has_filters, unfilt_chunk_bytes);
+            let nrecords = chunk_addrs.len() as u16;
+            Ok(encode_btree_v2_header(btree_leaf_addr, btree_type, rec_size, nrecords))
+        }
+        _ => Ok(vec![]),
     }
 }
 
@@ -791,7 +906,14 @@ fn compute_index_meta_size(ci: &ChunkedInfo) -> usize {
             let (hdr_size, iblk_size, dblk_size) = ext_array_sizes(ci);
             hdr_size + iblk_size + dblk_size
         }
-        _ => 0, // TODO: BTreeV2
+        5 => {
+            // BTreeV2: only the BTHD goes in the metadata region.
+            // The leaf node goes after chunk data (handled separately).
+            // BTHD: sig(4) + ver(1) + type(1) + node_size(4) + rec_size(2) + depth(2)
+            //   + split(1) + merge(1) + root_addr(8) + nrecords(2) + total_records(8) + checksum(4)
+            38
+        }
+        _ => 0,
     }
 }
 
@@ -1177,6 +1299,240 @@ fn encode_btree_v1_chunk_node(
 
     // Zero-fill remaining entries to reach the fixed node size
     buf.resize(node_size, 0);
+    buf
+}
+
+fn align_up(pos: usize, alignment: usize) -> usize {
+    (pos + alignment - 1) / alignment * alignment
+}
+
+/// Compute the BTree v2 record type and size for chunk indexing.
+/// Returns (btree_type, rec_size, chunk_size_len).
+/// Non-filtered: type 10, rec = addr(8) + ndims*scaled(8).
+/// Filtered: type 11, rec = addr(8) + chunk_nbytes(chunk_size_len) + filter_mask(4) + ndims*scaled(8).
+fn btree_v2_record_info(ndims: usize, has_filters: bool, unfilt_chunk_bytes: u64) -> (u8, u16, usize) {
+    let scaled_enc: usize = 8; // unlimited dims → 8 bytes per scaled offset
+    if has_filters {
+        // chunk_size_len: empirically matches C library with formula
+        // (floor(log2(size)) + 15) / 8, minimum 2.
+        let log2 = if unfilt_chunk_bytes > 0 {
+            63 - unfilt_chunk_bytes.leading_zeros() as usize
+        } else {
+            0
+        };
+        let chunk_size_len = ((log2 + 15) / 8).max(2);
+        let rec_size = 8 + chunk_size_len + 4 + ndims * scaled_enc;
+        (11, rec_size as u16, chunk_size_len)
+    } else {
+        let rec_size = 8 + ndims * scaled_enc;
+        (10, rec_size as u16, 0)
+    }
+}
+
+/// Encode BTree v2 header (BTHD) for chunk index type 5.
+fn encode_btree_v2_header(
+    root_addr: u64,
+    btree_type: u8,
+    rec_size: u16,
+    nrecords: u16,
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(38);
+    buf.extend_from_slice(b"BTHD");
+    buf.push(0); // version
+    buf.push(btree_type);
+    buf.extend_from_slice(&2048u32.to_le_bytes()); // node_size
+    buf.extend_from_slice(&rec_size.to_le_bytes());
+    buf.extend_from_slice(&0u16.to_le_bytes()); // depth = 0 (single leaf)
+    buf.push(100); // split_percent
+    buf.push(40); // merge_percent
+    buf.extend_from_slice(&root_addr.to_le_bytes());
+    buf.extend_from_slice(&nrecords.to_le_bytes());
+    buf.extend_from_slice(&(nrecords as u64).to_le_bytes());
+    let cs = crate::checksum::lookup3(&buf);
+    buf.extend_from_slice(&cs.to_le_bytes());
+    debug_assert_eq!(buf.len(), 38);
+    buf
+}
+
+/// Encode BTree v2 leaf node (BTLF) for chunk index type 5.
+fn encode_btree_v2_leaf(
+    chunk_addrs: &[u64],
+    chunk_coords: &[Vec<u64>],
+    filtered_sizes: &[u64],
+    ndims: usize,
+    btree_type: u8,
+    chunk_size_len: usize,
+    node_size: usize,
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(node_size);
+    buf.extend_from_slice(b"BTLF");
+    buf.push(0); // version
+    buf.push(btree_type);
+
+    for (i, &addr) in chunk_addrs.iter().enumerate() {
+        buf.extend_from_slice(&addr.to_le_bytes());
+        if btree_type == 11 {
+            // Filtered record: chunk_nbytes(chunk_size_len) + filter_mask(4)
+            let nbytes = filtered_sizes[i];
+            match chunk_size_len {
+                1 => buf.push(nbytes as u8),
+                2 => buf.extend_from_slice(&(nbytes as u16).to_le_bytes()),
+                4 => buf.extend_from_slice(&(nbytes as u32).to_le_bytes()),
+                8 => buf.extend_from_slice(&nbytes.to_le_bytes()),
+                _ => {
+                    // Variable-width encoding (3, 5, 6, 7 bytes)
+                    for b in 0..chunk_size_len {
+                        buf.push((nbytes >> (b * 8)) as u8);
+                    }
+                }
+            }
+            buf.extend_from_slice(&0u32.to_le_bytes()); // filter_mask
+        }
+        // Scaled offsets (chunk_coords are already in grid/scaled space)
+        for d in 0..ndims {
+            buf.extend_from_slice(&chunk_coords[i][d].to_le_bytes());
+        }
+    }
+
+    // Checksum immediately after records, then zero-pad to node_size.
+    let cs = crate::checksum::lookup3(&buf);
+    buf.extend_from_slice(&cs.to_le_bytes());
+    buf.resize(node_size, 0);
+    debug_assert_eq!(buf.len(), node_size);
+    buf
+}
+
+/// Compute the C library's vlen element insertion order.
+///
+/// The C library converts vlen data in-place. When dest element size (16 bytes
+/// for heap IDs) > source element size (8 bytes for pointers), it processes
+/// elements in a specific order to avoid buffer overwrites:
+///   1. Compute `safe = nelmts - ceil(nelmts * src_stride / dst_stride)` safe
+///      elements at the end that don't overlap with source.
+///   2. Process those forward, then process remaining backwards.
+///
+/// For vlen strings (src=8, dst=16), this produces a specific ordering.
+/// For vlen sequences (src=16, dst=16), forward order is used.
+/// Compute vlen GCOL insertion order for string types (src_stride=8, dst_stride=16).
+fn vlen_string_gcol_order(n: usize) -> Vec<usize> {
+    if n == 0 {
+        return vec![];
+    }
+    let s_stride: usize = 8;
+    let d_stride: usize = 16;
+
+    let mut result = Vec::with_capacity(n);
+    let mut remaining = n;
+
+    while remaining > 0 {
+        if d_stride > s_stride {
+            let safe = remaining - ((remaining * s_stride + d_stride - 1) / d_stride);
+            if safe < 2 {
+                // Reverse the remaining elements (always at the start of the array)
+                for i in (0..remaining).rev() {
+                    result.push(i);
+                }
+                break;
+            } else {
+                // Process `safe` elements forward from position (remaining - safe)
+                let start = n - remaining + (remaining - safe);
+                for i in 0..safe {
+                    result.push(start + i);
+                }
+                remaining -= safe;
+            }
+        } else {
+            // Forward
+            let start = n - remaining;
+            for i in 0..remaining {
+                result.push(start + i);
+            }
+            break;
+        }
+    }
+    result
+}
+
+/// Build a compat GCOL (Global Heap Collection) for vlen elements.
+///
+/// The ordered_elements slice gives the elements in insertion order (as the C library
+/// would produce). The GCOL is padded to 4096 bytes (H5HG_MINSIZE).
+fn build_gcol_compat(ordered_elements: &[&Vec<u8>]) -> Vec<u8> {
+    let sl = crate::writer::encode::SIZE_OF_LENGTHS as usize;
+    let obj_hdr = 8 + sl; // index(2) + refcount(2) + reserved(4) + size(L)
+    let header_size = 8 + sl; // sig(4) + ver(1) + reserved(3) + collection_size(L)
+
+    // Compute objects size.
+    let mut objects_size = 0usize;
+    for elem in ordered_elements {
+        let padded = (elem.len() + 7) & !7;
+        objects_size += obj_hdr + padded;
+    }
+
+    // Free space marker.
+    let used = header_size + objects_size;
+    let min_size = 4096; // H5HG_MINSIZE
+    let collection_size = used.max(min_size);
+    // The free space marker needs at least obj_hdr bytes.
+    let collection_size = collection_size.max(used + obj_hdr);
+
+    let mut buf = vec![0u8; collection_size];
+
+    // Header
+    buf[0..4].copy_from_slice(b"GCOL");
+    buf[4] = 1; // version
+    // reserved[5..8] = 0
+    buf[8..16].copy_from_slice(&(collection_size as u64).to_le_bytes());
+
+    let mut pos = header_size;
+    for (i, elem) in ordered_elements.iter().enumerate() {
+        let idx = (i + 1) as u16;
+        buf[pos..pos + 2].copy_from_slice(&idx.to_le_bytes());
+        // ref_count = 0 (C library default for fresh objects)
+        buf[pos + 2..pos + 4].copy_from_slice(&0u16.to_le_bytes());
+        // reserved[4..8] = 0
+        buf[pos + 8..pos + 16].copy_from_slice(&(elem.len() as u64).to_le_bytes());
+        buf[pos + 16..pos + 16 + elem.len()].copy_from_slice(elem);
+        let padded = (elem.len() + 7) & !7;
+        pos += obj_hdr + padded;
+    }
+
+    // Free space marker: index=0, ref_count=0, reserved=0, size=remaining
+    let free_space = collection_size - pos;
+    // index(2) = 0 already, ref_count(2) = 0 already, reserved(4) = 0 already
+    buf[pos + 8..pos + 16].copy_from_slice(&(free_space as u64).to_le_bytes());
+
+    buf
+}
+
+/// Build vlen heap IDs with compat GCOL ordering.
+///
+/// Returns the heap ID data (4+8+4 bytes per element) where each element
+/// references the correct GCOL object.
+fn build_vlen_heap_ids_compat(
+    elements: &[Vec<u8>],
+    gcol_addr: u64,
+    gcol_order: &[usize],
+) -> Vec<u8> {
+    // Build a mapping: original_element_index → gcol_object_index (1-based)
+    let mut elem_to_gcol_idx = vec![0u32; elements.len()];
+    for (gcol_pos, &orig_idx) in gcol_order.iter().enumerate() {
+        elem_to_gcol_idx[orig_idx] = (gcol_pos + 1) as u32;
+    }
+
+    let heap_id_size = 4 + 8 + 4; // seq_len + addr + idx
+    let mut buf = Vec::with_capacity(elements.len() * heap_id_size);
+    for (i, elem) in elements.iter().enumerate() {
+        if elem.is_empty() {
+            buf.extend_from_slice(&0u32.to_le_bytes());
+            buf.extend_from_slice(&UNDEF_ADDR.to_le_bytes());
+            buf.extend_from_slice(&0u32.to_le_bytes());
+        } else {
+            buf.extend_from_slice(&(elem.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&gcol_addr.to_le_bytes());
+            buf.extend_from_slice(&elem_to_gcol_idx[i].to_le_bytes());
+        }
+    }
     buf
 }
 

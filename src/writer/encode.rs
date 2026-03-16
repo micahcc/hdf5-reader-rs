@@ -285,7 +285,7 @@ pub(crate) fn encode_datatype(dt: &Datatype) -> Result<Vec<u8>> {
             padding,
             char_set,
         } => {
-            let class_version_byte = (9u8) | (4u8 << 4);
+            let class_version_byte = (9u8) | (1u8 << 4);
             let mut class_bits_lo = 0u8;
             if *is_string {
                 class_bits_lo |= 0x01;
@@ -536,9 +536,10 @@ pub(crate) fn encode_chunked_layout(
             buf.push(10); // max_dblk_page_nelmts_bits
         }
         5 => {
-            buf.extend_from_slice(&4096u32.to_le_bytes());
-            buf.push(98);
-            buf.push(40);
+            // BTreeV2 creation parameters:
+            buf.extend_from_slice(&2048u32.to_le_bytes()); // node_size
+            buf.push(100); // split_percent
+            buf.push(40); // merge_percent
         }
         _ => {}
     }

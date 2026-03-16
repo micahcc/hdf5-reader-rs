@@ -1213,3 +1213,54 @@ fn compat_ea_large() {
     ds.set_chunked(&[4], vec![]);
     assert_bytes_match(&w.to_bytes().unwrap(), "tests/fixtures/ea_large.h5");
 }
+
+#[test]
+fn compat_btree_v2_chunks() {
+    let mut w = FileWriter::with_options(compat_opts_v3());
+    // 2D 6×4, values 0..23, both dims unlimited → BTreeV2 index
+    let vals: Vec<u8> = (0..24i32).flat_map(|x| x.to_le_bytes()).collect();
+    let ds = w.root_mut().add_dataset(
+        "bt2chunked",
+        crate::Datatype::native_i32(),
+        &[6, 4],
+        vals,
+    );
+    ds.set_max_dims(&[u64::MAX, u64::MAX]);
+    ds.set_chunked(&[3, 2], vec![]);
+    assert_bytes_match(&w.to_bytes().unwrap(), "tests/fixtures/btree_v2_chunks.h5");
+}
+
+#[test]
+#[cfg(feature = "system-zlib")]
+fn compat_btree_v2_filtered() {
+    let mut w = FileWriter::with_options(compat_opts_v3());
+    let vals: Vec<u8> = (0..24i32).flat_map(|x| x.to_le_bytes()).collect();
+    let ds = w.root_mut().add_dataset(
+        "filtered",
+        crate::Datatype::native_i32(),
+        &[6, 4],
+        vals,
+    );
+    ds.set_max_dims(&[u64::MAX, u64::MAX]);
+    ds.set_chunked(&[3, 2], vec![crate::writer::types::ChunkFilter::Deflate(6)]);
+    assert_bytes_match(&w.to_bytes().unwrap(), "tests/fixtures/btree_v2_filtered.h5");
+}
+
+#[test]
+fn compat_vlen_strings() {
+    let mut w = FileWriter::with_options(compat_opts_v3());
+    let dt = crate::Datatype::VarLen {
+        element_type: Box::new(crate::Datatype::native_u8()),
+        is_string: true,
+        padding: Some(crate::datatype::StringPadding::NullTerminate),
+        char_set: Some(crate::datatype::CharacterSet::Utf8),
+    };
+    let elements: Vec<Vec<u8>> = vec![
+        b"hello".to_vec(),
+        b"world".to_vec(),
+        b"HDF5".to_vec(),
+        b"variable-length".to_vec(),
+    ];
+    w.root_mut().add_vlen_dataset("names", dt, &[4], elements);
+    assert_bytes_match(&w.to_bytes().unwrap(), "tests/fixtures/vlen_strings.h5");
+}
