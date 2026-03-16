@@ -377,7 +377,7 @@ fn encode_fshd(
     total_space: u64,
     serial_list_addr: u64,
     serial_list_alloc: u64,
-    _max_heap_size_bits: u16,
+    max_heap_size_bits: u16,
 ) -> Vec<u8> {
     let mut buf = Vec::with_capacity(82);
 
@@ -401,7 +401,7 @@ fn encode_fshd(
     // expand_percent (2 bytes) — C default: 120
     buf.extend_from_slice(&120u16.to_le_bytes());
     // address_size_encoding (2 bytes, in bits)
-    buf.extend_from_slice(&40u16.to_le_bytes());
+    buf.extend_from_slice(&max_heap_size_bits.to_le_bytes());
     // max_section_size (8 bytes) — C default: 65536
     buf.extend_from_slice(&65536u64.to_le_bytes());
 
@@ -491,6 +491,730 @@ fn encode_fhdb(
     let block_cksum = checksum::lookup3(&buf);
     buf[cksum_off..cksum_off + 4].copy_from_slice(&block_cksum.to_le_bytes());
 
+    buf
+}
+
+/// Encode dense attribute metadata structures (FRHP + BTHD + FSHD + BTLF + FSSE)
+/// with FHDB placed at a separate address (in the data region).
+///
+/// `base_addr` is where FRHP starts (right after the OHDR).
+/// `fhdb_addr` is where the FHDB will be placed (in the data region).
+pub(crate) fn encode_dense_attr_structures_split(
+    storage: &DenseAttrStorage,
+    base_addr: u64,
+    fhdb_addr: u64,
+) -> Result<Vec<u8>> {
+    let sizes = compute_dense_attr_sizes(storage);
+    let n_attrs = storage.attr_bodies.len();
+
+    // Compute addresses of each sub-structure (metadata only).
+    let frhp_addr = base_addr;
+    let bthd_addr = frhp_addr + sizes.frhp_size as u64;
+    let fshd_addr = bthd_addr + sizes.bthd_size as u64;
+    let btlf_addr = fshd_addr + sizes.fshd_size as u64;
+    let fsse_addr = btlf_addr + sizes.btlf_size as u64;
+
+    let max_heap_size_bits: u16 = 40;
+    let block_offset_bytes = (max_heap_size_bits as usize).div_ceil(8);
+    let dblk_header_size = 4 + 1 + 8 + block_offset_bytes + 4; // 22
+
+    // Place attributes sequentially after the direct block header.
+    let mut attr_offsets = Vec::with_capacity(n_attrs);
+    let mut offset = dblk_header_size;
+    for body in &storage.attr_bodies {
+        attr_offsets.push(offset);
+        offset += body.len();
+    }
+
+    let free_offset = offset;
+    let free_size = storage.dblk_size - free_offset;
+
+    // Build heap IDs.
+    let heap_id_len: u16 = 8;
+    let mut heap_ids = Vec::with_capacity(n_attrs);
+    for i in 0..n_attrs {
+        let off = attr_offsets[i] as u64;
+        let len = storage.attr_bodies[i].len() as u64;
+        let mut hid = [0u8; 8];
+        hid[0] = 0x00;
+        let packed = off | (len << 40);
+        hid[1..].copy_from_slice(&packed.to_le_bytes()[..7]);
+        heap_ids.push(hid);
+    }
+
+    // B-tree v2 records.
+    let rec_size: u16 = 17;
+    let mut records: Vec<(u32, usize)> = storage
+        .name_hashes
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(i, h)| (h, i))
+        .collect();
+    records.sort_by_key(|&(hash, _)| hash);
+
+    // Encode BTLF.
+    let btlf = encode_btlf(&records, &heap_ids, rec_size, storage.btree_node_size);
+
+    // Encode BTHD.
+    let bthd = encode_bthd(
+        btlf_addr,
+        n_attrs as u16,
+        n_attrs as u64,
+        rec_size,
+        storage.btree_node_size as u32,
+    );
+
+    let sect_off_size = limit_enc_size_u64(free_size as u64);
+
+    // Encode FSSE.
+    let fsse_data_size = 1 + sect_off_size + 1 + sect_off_size;
+    let fsse_total = 4 + 1 + 8 + fsse_data_size + 4;
+    let fsse_alloc = 27.max(fsse_total);
+    let fsse = encode_fsse(fshd_addr, free_offset, free_size, sect_off_size, fsse_alloc);
+
+    // Encode FSHD.
+    let fshd = encode_fshd(
+        free_size as u64,
+        fsse_addr,
+        fsse_alloc as u64,
+        max_heap_size_bits,
+    );
+
+    // Encode FRHP — root_block_addr points to FHDB in data region.
+    let total_attr_bytes: usize = storage.attr_bodies.iter().map(|b| b.len()).sum();
+    let frhp = encode_frhp(
+        heap_id_len,
+        max_heap_size_bits,
+        n_attrs as u64,
+        total_attr_bytes as u64,
+        storage.dblk_size as u64,
+        free_size as u64,
+        fshd_addr,
+        fhdb_addr,
+    );
+
+    // Concatenate metadata structures (no FHDB).
+    let meta_size =
+        sizes.frhp_size + sizes.bthd_size + sizes.fshd_size + sizes.btlf_size + sizes.fsse_size;
+    let mut buf = Vec::with_capacity(meta_size);
+    buf.extend_from_slice(&frhp);
+    buf.extend_from_slice(&bthd);
+    buf.extend_from_slice(&fshd);
+    buf.extend_from_slice(&btlf);
+    buf.extend_from_slice(&fsse);
+
+    debug_assert_eq!(buf.len(), meta_size);
+    Ok(buf)
+}
+
+/// Encode just the FHDB (fractal heap direct block) as a standalone blob.
+pub(crate) fn encode_fhdb_standalone(storage: &DenseAttrStorage, frhp_addr: u64) -> Vec<u8> {
+    let max_heap_size_bits: u16 = 40;
+    let block_offset_bytes = (max_heap_size_bits as usize).div_ceil(8);
+    let dblk_header_size = 4 + 1 + 8 + block_offset_bytes + 4; // 22
+    encode_fhdb(
+        frhp_addr,
+        max_heap_size_bits,
+        storage.dblk_size,
+        &storage.attr_bodies,
+        dblk_header_size,
+    )
+}
+
+// ─── Dense link storage ───────────────────────────────────────────────
+
+/// Parameters for dense link storage with creation order.
+pub(crate) struct DenseLinkStorage {
+    /// Serialized link message bodies (with creation order).
+    pub link_bodies: Vec<Vec<u8>>,
+    /// Name hashes for each link.
+    pub name_hashes: Vec<u32>,
+    /// Direct block size (512 for links).
+    pub dblk_size: usize,
+    /// B-tree v2 node size.
+    pub btree_node_size: usize,
+}
+
+/// Sizes of dense link sub-structures.
+pub(crate) struct DenseLinkSizes {
+    pub frhp_size: usize,
+    pub bthd_name_size: usize,
+    pub bthd_crt_size: usize,
+    pub fshd_size: usize,
+    pub btlf_name_size: usize,
+    pub btlf_crt_size: usize,
+    pub fsse_size: usize,
+    pub fhdb_size: usize,
+}
+
+impl DenseLinkSizes {
+    /// Metadata total (FRHP + BTHD×2 + FSHD + BTLF×2 + FSSE). Excludes FHDB.
+    pub fn meta_total(&self) -> usize {
+        self.frhp_size
+            + self.bthd_name_size
+            + self.bthd_crt_size
+            + self.fshd_size
+            + self.btlf_name_size
+            + self.btlf_crt_size
+            + self.fsse_size
+    }
+}
+
+/// Compute dense link storage from link names, addresses, and creation orders.
+pub(crate) fn compute_dense_link_storage(names: &[String], addrs: &[u64]) -> DenseLinkStorage {
+    use crate::writer::encode::encode_link_body_crt_order;
+
+    let mut link_bodies = Vec::with_capacity(names.len());
+    let mut name_hashes = Vec::with_capacity(names.len());
+    for (i, name) in names.iter().enumerate() {
+        let body = encode_link_body_crt_order(name, addrs[i], i as u64);
+        let hash = crate::checksum::lookup3(name.as_bytes());
+        link_bodies.push(body);
+        name_hashes.push(hash);
+    }
+    DenseLinkStorage {
+        link_bodies,
+        name_hashes,
+        dblk_size: 512,
+        btree_node_size: 512,
+    }
+}
+
+pub(crate) fn compute_dense_link_sizes(storage: &DenseLinkStorage) -> DenseLinkSizes {
+    DenseLinkSizes {
+        frhp_size: 146,
+        bthd_name_size: 38,
+        bthd_crt_size: 38,
+        fshd_size: 82,
+        btlf_name_size: storage.btree_node_size,
+        btlf_crt_size: storage.btree_node_size,
+        fsse_size: 26, // typical for link heaps
+        fhdb_size: storage.dblk_size,
+    }
+}
+
+/// Encode dense link structures (metadata only: FRHP + BTHD_name + BTHD_crt + FSHD + BTLF_name + BTLF_crt).
+/// FSSE is encoded separately. FHDB goes in sdata.
+pub(crate) fn encode_dense_link_meta(
+    storage: &DenseLinkStorage,
+    base_addr: u64,
+    fhdb_addr: u64,
+    fsse_addr_override: u64,
+) -> Result<Vec<u8>> {
+    let sizes = compute_dense_link_sizes(storage);
+    let n = storage.link_bodies.len();
+
+    let frhp_addr = base_addr;
+    let bthd_name_addr = frhp_addr + sizes.frhp_size as u64;
+    let bthd_crt_addr = bthd_name_addr + sizes.bthd_name_size as u64;
+    let fshd_addr = bthd_crt_addr + sizes.bthd_crt_size as u64;
+    let btlf_name_addr = fshd_addr + sizes.fshd_size as u64;
+    let btlf_crt_addr = btlf_name_addr + sizes.btlf_name_size as u64;
+
+    // Link heap: heap_id_len=7, max_heap_size=32 bits, block_offset_bytes=4
+    let max_heap_size_bits: u16 = 32;
+    let block_offset_bytes = 4usize;
+    let dblk_header_size = 4 + 1 + 8 + block_offset_bytes + 4; // 21
+
+    let mut link_offsets = Vec::with_capacity(n);
+    let mut offset = dblk_header_size;
+    for body in &storage.link_bodies {
+        link_offsets.push(offset);
+        offset += body.len();
+    }
+    let free_offset = offset;
+    let free_size = storage.dblk_size - free_offset;
+
+    // Build heap IDs (7 bytes: byte0=0, then offset(32bit) + length(16bit) packed LE)
+    let heap_id_len: u16 = 7;
+    let mut heap_ids: Vec<[u8; 7]> = Vec::with_capacity(n);
+    for i in 0..n {
+        let off = link_offsets[i] as u64;
+        let len = storage.link_bodies[i].len() as u64;
+        let mut hid = [0u8; 7];
+        hid[0] = 0x00;
+        let packed = off | (len << 32);
+        hid[1..].copy_from_slice(&packed.to_le_bytes()[..6]);
+        heap_ids.push(hid);
+    }
+
+    // B-tree type 5 records: sorted by name_hash. Record = hash(4) + heap_id(7).
+    let rec_size_name: u16 = 4 + heap_id_len;
+    let mut name_records: Vec<(u32, usize)> = storage
+        .name_hashes
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(i, h)| (h, i))
+        .collect();
+    name_records.sort_by_key(|&(hash, _)| hash);
+
+    // B-tree type 6 records: sorted by creation_order. Record = crt_order(8) + heap_id(7).
+    let rec_size_crt: u16 = 8 + heap_id_len;
+
+    // Encode BTLF type 5 (name)
+    let btlf_name = encode_btlf_type5(&name_records, &heap_ids, storage.btree_node_size);
+    // Encode BTLF type 6 (creation order) — records in order 0,1,2,...
+    let btlf_crt = encode_btlf_type6(&heap_ids, storage.btree_node_size);
+
+    // Encode BTHDs
+    let bthd_name = encode_bthd(
+        btlf_name_addr,
+        n as u16,
+        n as u64,
+        rec_size_name,
+        storage.btree_node_size as u32,
+    );
+    // Override type to 5
+    let mut bthd_name = bthd_name;
+    bthd_name[5] = 5;
+
+    let bthd_crt = {
+        let mut b = encode_bthd(
+            btlf_crt_addr,
+            n as u16,
+            n as u64,
+            rec_size_crt,
+            storage.btree_node_size as u32,
+        );
+        b[5] = 6; // type 6
+        // Recompute checksum since we changed the type byte
+        let cksum = crate::checksum::lookup3(&b[..b.len() - 4]);
+        let len = b.len();
+        b[len - 4..].copy_from_slice(&cksum.to_le_bytes());
+        b
+    };
+
+    // Fix BTHD name checksum too
+    {
+        let cksum = crate::checksum::lookup3(&bthd_name[..bthd_name.len() - 4]);
+        let len = bthd_name.len();
+        bthd_name[len - 4..].copy_from_slice(&cksum.to_le_bytes());
+    }
+
+    // FSSE for links
+    let sect_off_size = limit_enc_size_u64(free_size as u64);
+    let fsse_data_size = 1 + sect_off_size + 1 + sect_off_size;
+    let fsse_total = 4 + 1 + 8 + fsse_data_size + 4;
+    let fsse_alloc = 26.max(fsse_total);
+
+    let _fsse = encode_fsse(fshd_addr, free_offset, free_size, sect_off_size, fsse_alloc);
+
+    // FSHD — uses externally-provided FSSE address for interleaved layouts.
+    let fshd = encode_fshd(
+        free_size as u64,
+        fsse_addr_override,
+        fsse_alloc as u64,
+        max_heap_size_bits,
+    );
+
+    // FRHP
+    let total_link_bytes: usize = storage.link_bodies.iter().map(|b| b.len()).sum();
+    let frhp = encode_frhp_link(
+        heap_id_len,
+        max_heap_size_bits,
+        n as u64,
+        total_link_bytes as u64,
+        storage.dblk_size as u64,
+        free_size as u64,
+        fshd_addr,
+        fhdb_addr,
+    );
+
+    let meta_size = sizes.frhp_size
+        + sizes.bthd_name_size
+        + sizes.bthd_crt_size
+        + sizes.fshd_size
+        + sizes.btlf_name_size
+        + sizes.btlf_crt_size;
+    let mut buf = Vec::with_capacity(meta_size);
+    buf.extend_from_slice(&frhp);
+    buf.extend_from_slice(&bthd_name);
+    buf.extend_from_slice(&bthd_crt);
+    buf.extend_from_slice(&fshd);
+    buf.extend_from_slice(&btlf_name);
+    buf.extend_from_slice(&btlf_crt);
+
+    Ok(buf)
+}
+
+/// Encode FSSE for link heap (standalone).
+pub(crate) fn encode_link_fsse(storage: &DenseLinkStorage, fshd_addr: u64) -> Vec<u8> {
+    let max_heap_size_bits: u16 = 32;
+    let block_offset_bytes = (max_heap_size_bits as usize).div_ceil(8);
+    let dblk_header_size = 4 + 1 + 8 + block_offset_bytes + 4;
+    let mut offset = dblk_header_size;
+    for body in &storage.link_bodies {
+        offset += body.len();
+    }
+    let free_offset = offset;
+    let free_size = storage.dblk_size - free_offset;
+    let sect_off_size = limit_enc_size_u64(free_size as u64);
+    let fsse_data_size = 1 + sect_off_size + 1 + sect_off_size;
+    let fsse_total = 4 + 1 + 8 + fsse_data_size + 4;
+    let fsse_alloc = 26.max(fsse_total);
+    encode_fsse(fshd_addr, free_offset, free_size, sect_off_size, fsse_alloc)
+}
+
+/// Encode FHDB for link heap (standalone).
+pub(crate) fn encode_link_fhdb(storage: &DenseLinkStorage, frhp_addr: u64) -> Vec<u8> {
+    let max_heap_size_bits: u16 = 32;
+    let block_offset_bytes = (max_heap_size_bits as usize).div_ceil(8);
+    let dblk_header_size = 4 + 1 + 8 + block_offset_bytes + 4; // 21
+    encode_fhdb(
+        frhp_addr,
+        max_heap_size_bits,
+        storage.dblk_size,
+        &storage.link_bodies,
+        dblk_header_size,
+    )
+}
+
+fn encode_frhp_link(
+    heap_id_len: u16,
+    max_heap_size_bits: u16,
+    num_managed_objs: u64,
+    _total_bytes: u64,
+    dblk_size: u64,
+    free_space: u64,
+    fsm_addr: u64,
+    root_block_addr: u64,
+) -> Vec<u8> {
+    // Same structure as attr FRHP but with link-specific heap_id_len and max_heap_size
+    encode_frhp(
+        heap_id_len,
+        max_heap_size_bits,
+        num_managed_objs,
+        _total_bytes,
+        dblk_size,
+        free_space,
+        fsm_addr,
+        root_block_addr,
+    )
+}
+
+fn encode_btlf_type5(
+    name_records: &[(u32, usize)], // (hash, link_index) sorted by hash
+    heap_ids: &[[u8; 7]],
+    node_size: usize,
+) -> Vec<u8> {
+    let mut buf = vec![0u8; node_size];
+    buf[0..4].copy_from_slice(b"BTLF");
+    buf[4] = 0; // version
+    buf[5] = 5; // type 5 = link name
+
+    let mut off = 6;
+    for &(hash, idx) in name_records {
+        buf[off..off + 4].copy_from_slice(&hash.to_le_bytes());
+        off += 4;
+        buf[off..off + 7].copy_from_slice(&heap_ids[idx]);
+        off += 7;
+    }
+
+    let cksum = crate::checksum::lookup3(&buf[..off]);
+    buf[off..off + 4].copy_from_slice(&cksum.to_le_bytes());
+    buf
+}
+
+fn encode_btlf_type6(heap_ids: &[[u8; 7]], node_size: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; node_size];
+    buf[0..4].copy_from_slice(b"BTLF");
+    buf[4] = 0; // version
+    buf[5] = 6; // type 6 = link creation order
+
+    let mut off = 6;
+    for (i, hid) in heap_ids.iter().enumerate() {
+        // Record: creation_order(8) + heap_id(7)
+        buf[off..off + 8].copy_from_slice(&(i as u64).to_le_bytes());
+        off += 8;
+        buf[off..off + 7].copy_from_slice(hid);
+        off += 7;
+    }
+
+    let cksum = crate::checksum::lookup3(&buf[..off]);
+    buf[off..off + 4].copy_from_slice(&cksum.to_le_bytes());
+    buf
+}
+
+// ─── Dense attrs with creation order ──────────────────────────────────
+
+/// Sizes of dense attr sub-structures with creation order (adds BTLF for type 9).
+pub(crate) struct DenseAttrCrtSizes {
+    pub frhp_size: usize,
+    pub bthd_name_size: usize,
+    pub bthd_crt_size: usize,
+    pub fshd_size: usize,
+    pub btlf_name_size: usize,
+    pub btlf_crt_size: usize,
+    pub fsse_size: usize,
+    pub fhdb_size: usize,
+}
+
+impl DenseAttrCrtSizes {
+    pub fn meta_total(&self) -> usize {
+        self.frhp_size
+            + self.bthd_name_size
+            + self.bthd_crt_size
+            + self.fshd_size
+            + self.btlf_name_size
+            + self.btlf_crt_size
+            + self.fsse_size
+    }
+}
+
+pub(crate) fn compute_dense_attr_crt_sizes(storage: &DenseAttrStorage) -> DenseAttrCrtSizes {
+    DenseAttrCrtSizes {
+        frhp_size: 146,
+        bthd_name_size: 38,
+        bthd_crt_size: 38,
+        fshd_size: 82,
+        btlf_name_size: storage.btree_node_size,
+        btlf_crt_size: storage.btree_node_size,
+        fsse_size: 27,
+        fhdb_size: storage.dblk_size,
+    }
+}
+
+/// Encode dense attr metadata with creation order (FRHP + BTHD_name + BTHD_crt).
+/// This is part 1 — FSHD + BTLFs are separate (part 2) due to C library allocation order.
+pub(crate) fn encode_dense_attr_crt_part1(
+    storage: &DenseAttrStorage,
+    frhp_addr: u64,
+    fhdb_addr: u64,
+    fshd_addr: u64,
+    fsse_addr: u64,
+) -> Result<Vec<u8>> {
+    let sizes = compute_dense_attr_crt_sizes(storage);
+    let n = storage.attr_bodies.len();
+    let bthd_name_addr = frhp_addr + sizes.frhp_size as u64;
+    let bthd_crt_addr = bthd_name_addr + sizes.bthd_name_size as u64;
+
+    let max_heap_size_bits: u16 = 40;
+    let block_offset_bytes = (max_heap_size_bits as usize).div_ceil(8);
+    let dblk_header_size = 4 + 1 + 8 + block_offset_bytes + 4; // 22
+
+    let mut attr_offsets = Vec::with_capacity(n);
+    let mut offset = dblk_header_size;
+    for body in &storage.attr_bodies {
+        attr_offsets.push(offset);
+        offset += body.len();
+    }
+    let free_offset = offset;
+    let free_size = storage.dblk_size - free_offset;
+
+    // Build heap IDs (8 bytes)
+    let heap_id_len: u16 = 8;
+    let mut heap_ids = Vec::with_capacity(n);
+    for i in 0..n {
+        let off = attr_offsets[i] as u64;
+        let len = storage.attr_bodies[i].len() as u64;
+        let mut hid = [0u8; 8];
+        hid[0] = 0x00;
+        let packed = off | (len << 40);
+        hid[1..].copy_from_slice(&packed.to_le_bytes()[..7]);
+        heap_ids.push(hid);
+    }
+
+    // Type 8 records (name): sorted by hash
+    let rec_size_name: u16 = 17;
+    let mut name_records: Vec<(u32, usize)> = storage
+        .name_hashes
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(i, h)| (h, i))
+        .collect();
+    name_records.sort_by_key(|&(hash, _)| hash);
+
+    // Type 9 records (creation order): sorted by creation order (= index)
+    let rec_size_crt: u16 = 13;
+
+    // FSSE
+    let sect_off_size = limit_enc_size_u64(free_size as u64);
+    let fsse_data_size = 1 + sect_off_size + 1 + sect_off_size;
+    let fsse_total = 4 + 1 + 8 + fsse_data_size + 4;
+    let fsse_alloc = 27.max(fsse_total);
+
+    // BTHD name (type 8)
+    let btlf_name_addr = fshd_addr + sizes.fshd_size as u64;
+    let bthd_name = encode_bthd(
+        btlf_name_addr,
+        n as u16,
+        n as u64,
+        rec_size_name,
+        storage.btree_node_size as u32,
+    );
+
+    // BTHD crt (type 9)
+    let btlf_crt_addr = btlf_name_addr + sizes.btlf_name_size as u64;
+    let mut bthd_crt = encode_bthd(
+        btlf_crt_addr,
+        n as u16,
+        n as u64,
+        rec_size_crt,
+        storage.btree_node_size as u32,
+    );
+    bthd_crt[5] = 9; // override type to 9
+    let cksum = crate::checksum::lookup3(&bthd_crt[..bthd_crt.len() - 4]);
+    let len = bthd_crt.len();
+    bthd_crt[len - 4..].copy_from_slice(&cksum.to_le_bytes());
+
+    // FRHP
+    let total_attr_bytes: usize = storage.attr_bodies.iter().map(|b| b.len()).sum();
+    let frhp = encode_frhp(
+        heap_id_len,
+        max_heap_size_bits,
+        n as u64,
+        total_attr_bytes as u64,
+        storage.dblk_size as u64,
+        free_size as u64,
+        fshd_addr,
+        fhdb_addr,
+    );
+
+    // Part 1: FRHP + BTHD_name + BTHD_crt
+    let part1_size = sizes.frhp_size + sizes.bthd_name_size + sizes.bthd_crt_size;
+    let mut buf = Vec::with_capacity(part1_size);
+    buf.extend_from_slice(&frhp);
+    buf.extend_from_slice(&bthd_name);
+    buf.extend_from_slice(&bthd_crt);
+    Ok(buf)
+}
+
+/// Encode dense attr metadata part 2 (FSHD + BTLF_name + BTLF_crt).
+pub(crate) fn encode_dense_attr_crt_part2(
+    storage: &DenseAttrStorage,
+    fshd_addr: u64,
+    fsse_addr: u64,
+) -> Result<Vec<u8>> {
+    let sizes = compute_dense_attr_crt_sizes(storage);
+    let n = storage.attr_bodies.len();
+
+    let max_heap_size_bits: u16 = 40;
+    let block_offset_bytes = (max_heap_size_bits as usize).div_ceil(8);
+    let dblk_header_size = 4 + 1 + 8 + block_offset_bytes + 4;
+
+    let mut attr_offsets = Vec::with_capacity(n);
+    let mut offset = dblk_header_size;
+    for body in &storage.attr_bodies {
+        attr_offsets.push(offset);
+        offset += body.len();
+    }
+    let free_offset = offset;
+    let free_size = storage.dblk_size - free_offset;
+
+    let heap_id_len: u16 = 8;
+    let mut heap_ids = Vec::with_capacity(n);
+    for i in 0..n {
+        let off = attr_offsets[i] as u64;
+        let len = storage.attr_bodies[i].len() as u64;
+        let mut hid = [0u8; 8];
+        hid[0] = 0x00;
+        let packed = off | (len << 40);
+        hid[1..].copy_from_slice(&packed.to_le_bytes()[..7]);
+        heap_ids.push(hid);
+    }
+
+    let mut name_records: Vec<(u32, usize)> = storage
+        .name_hashes
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(i, h)| (h, i))
+        .collect();
+    name_records.sort_by_key(|&(hash, _)| hash);
+
+    let sect_off_size = limit_enc_size_u64(free_size as u64);
+    let fsse_data_size = 1 + sect_off_size + 1 + sect_off_size;
+    let fsse_total = 4 + 1 + 8 + fsse_data_size + 4;
+    let fsse_alloc = 27.max(fsse_total);
+
+    // FSHD
+    let fshd = encode_fshd(
+        free_size as u64,
+        fsse_addr,
+        fsse_alloc as u64,
+        max_heap_size_bits,
+    );
+
+    // BTLF type 8 (name)
+    let btlf_name = encode_btlf_type8_crt(&name_records, &heap_ids, storage.btree_node_size);
+
+    // BTLF type 9 (creation order)
+    let btlf_crt = encode_btlf_type9(&heap_ids, storage.btree_node_size);
+
+    let part2_size = sizes.fshd_size + sizes.btlf_name_size + sizes.btlf_crt_size;
+    let mut buf = Vec::with_capacity(part2_size);
+    buf.extend_from_slice(&fshd);
+    buf.extend_from_slice(&btlf_name);
+    buf.extend_from_slice(&btlf_crt);
+    Ok(buf)
+}
+
+/// Encode FSSE for attr heap with creation order (standalone).
+pub(crate) fn encode_attr_crt_fsse(storage: &DenseAttrStorage, fshd_addr: u64) -> Vec<u8> {
+    let max_heap_size_bits: u16 = 40;
+    let block_offset_bytes = (max_heap_size_bits as usize).div_ceil(8);
+    let dblk_header_size = 4 + 1 + 8 + block_offset_bytes + 4;
+    let mut offset = dblk_header_size;
+    for body in &storage.attr_bodies {
+        offset += body.len();
+    }
+    let free_offset = offset;
+    let free_size = storage.dblk_size - free_offset;
+    let sect_off_size = limit_enc_size_u64(free_size as u64);
+    let fsse_data_size = 1 + sect_off_size + 1 + sect_off_size;
+    let fsse_total = 4 + 1 + 8 + fsse_data_size + 4;
+    let fsse_alloc = 27.max(fsse_total);
+    encode_fsse(fshd_addr, free_offset, free_size, sect_off_size, fsse_alloc)
+}
+
+fn encode_btlf_type8_crt(
+    name_records: &[(u32, usize)],
+    heap_ids: &[[u8; 8]],
+    node_size: usize,
+) -> Vec<u8> {
+    let mut buf = vec![0u8; node_size];
+    buf[0..4].copy_from_slice(b"BTLF");
+    buf[4] = 0;
+    buf[5] = 8; // type 8
+
+    let mut off = 6;
+    for &(hash, idx) in name_records {
+        buf[off..off + 8].copy_from_slice(&heap_ids[idx]);
+        off += 8;
+        buf[off] = 0x00; // msg_flags
+        off += 1;
+        buf[off..off + 4].copy_from_slice(&(idx as u32).to_le_bytes()); // creation_order = index
+        off += 4;
+        buf[off..off + 4].copy_from_slice(&hash.to_le_bytes());
+        off += 4;
+    }
+
+    let cksum = crate::checksum::lookup3(&buf[..off]);
+    buf[off..off + 4].copy_from_slice(&cksum.to_le_bytes());
+    buf
+}
+
+fn encode_btlf_type9(heap_ids: &[[u8; 8]], node_size: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; node_size];
+    buf[0..4].copy_from_slice(b"BTLF");
+    buf[4] = 0;
+    buf[5] = 9; // type 9
+
+    let mut off = 6;
+    for (i, hid) in heap_ids.iter().enumerate() {
+        buf[off..off + 8].copy_from_slice(hid);
+        off += 8;
+        buf[off] = 0x00; // msg_flags
+        off += 1;
+        buf[off..off + 4].copy_from_slice(&(i as u32).to_le_bytes()); // creation_order
+        off += 4;
+    }
+
+    let cksum = crate::checksum::lookup3(&buf[..off]);
+    buf[off..off + 4].copy_from_slice(&cksum.to_le_bytes());
     buf
 }
 

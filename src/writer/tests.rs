@@ -1384,3 +1384,111 @@ fn compat_dense_attributes() {
     }
     assert_bytes_match(&w.to_bytes().unwrap(), "tests/fixtures/dense_attributes.h5");
 }
+
+#[test]
+fn compat_nil_messages() {
+    let mut w = FileWriter::with_options(compat_opts_v3());
+    let data: Vec<u8> = [1i32, 2, 3, 4]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    let ds = w
+        .root_mut()
+        .add_dataset("data", crate::Datatype::native_i32(), &[4], data);
+    ds.set_attr_phase_change(8, 6);
+    for i in 0..12 {
+        let name = format!("attribute_{i}");
+        let val = (((i + 1) * 10) as i32).to_le_bytes().to_vec();
+        ds.add_attribute(&name, crate::Datatype::native_i32(), &[], val);
+    }
+    assert_bytes_match(&w.to_bytes().unwrap(), "tests/fixtures/nil_messages.h5");
+}
+
+#[test]
+fn compat_creation_order() {
+    let mut w = FileWriter::with_options(compat_opts_v3());
+    let grp = w.root_mut().add_group("ordered");
+    grp.set_link_creation_order()
+        .set_link_phase_change(0, 0)
+        .set_attr_creation_order()
+        .set_attr_phase_change(0, 0);
+    grp.add_group("charlie");
+    grp.add_group("alpha");
+    grp.add_group("bravo");
+    grp.add_attribute(
+        "zebra",
+        crate::Datatype::native_i32(),
+        &[],
+        30i32.to_le_bytes().to_vec(),
+    );
+    grp.add_attribute(
+        "mango",
+        crate::Datatype::native_i32(),
+        &[],
+        10i32.to_le_bytes().to_vec(),
+    );
+    grp.add_attribute(
+        "apple",
+        crate::Datatype::native_i32(),
+        &[],
+        20i32.to_le_bytes().to_vec(),
+    );
+    assert_bytes_match(&w.to_bytes().unwrap(), "tests/fixtures/creation_order.h5");
+}
+
+#[test]
+fn compat_scaleoffset() {
+    let mut w = FileWriter::with_options(compat_opts_v2());
+    let vals: Vec<u8> = (1000..1008i32).flat_map(|x| x.to_le_bytes()).collect();
+    let ds = w
+        .root_mut()
+        .add_dataset("data", crate::Datatype::native_i32(), &[8], vals);
+    // chunk_dims=[8], 8 elements of i32, signed, LE
+    let so_params = crate::writer::types::ScaleOffsetParams::from_int(8, 4, true, true);
+    ds.set_chunked(
+        &[8],
+        vec![crate::writer::types::ChunkFilter::ScaleOffset(so_params)],
+    );
+    ds.set_layout_version(3);
+    assert_bytes_match(&w.to_bytes().unwrap(), "tests/fixtures/scaleoffset.h5");
+}
+
+#[test]
+fn compat_nbit() {
+    let mut w = FileWriter::with_options(compat_opts_v2());
+    // uint16 with 10-bit precision
+    let dt = crate::Datatype::FixedPoint {
+        size: 2,
+        byte_order: crate::datatype::ByteOrder::LittleEndian,
+        signed: false,
+        bit_offset: 0,
+        bit_precision: 10,
+    };
+    let vals: Vec<u8> = (0..8u16)
+        .map(|x| x * 100)
+        .flat_map(|x| x.to_le_bytes())
+        .collect();
+    let ds = w.root_mut().add_dataset("data", dt, &[8], vals);
+    let nbit_params = crate::writer::types::NbitParams::from_atomic(8, 2, 10, 0, true);
+    ds.set_chunked(
+        &[8],
+        vec![crate::writer::types::ChunkFilter::Nbit(nbit_params)],
+    );
+    ds.set_layout_version(3);
+    assert_bytes_match(&w.to_bytes().unwrap(), "tests/fixtures/nbit.h5");
+}
+
+#[test]
+fn compat_lzf() {
+    let mut w = FileWriter::with_options(compat_opts_v2());
+    let vals: Vec<u8> = (0..32i32)
+        .map(|x| x / 4)
+        .flat_map(|x| x.to_le_bytes())
+        .collect();
+    let ds = w
+        .root_mut()
+        .add_dataset("data", crate::Datatype::native_i32(), &[32], vals);
+    ds.set_chunked(&[32], vec![crate::writer::types::ChunkFilter::Lzf]);
+    ds.set_layout_version(3);
+    assert_bytes_match(&w.to_bytes().unwrap(), "tests/fixtures/lzf_c.h5");
+}

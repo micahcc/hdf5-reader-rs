@@ -11,6 +11,12 @@ pub struct GroupNode {
     /// (max_compact, min_dense) — when attribute count exceeds max_compact,
     /// storage switches to dense (fractal heap + B-tree v2).
     pub(crate) attr_phase_change: Option<(u16, u16)>,
+    /// Non-default link storage phase change thresholds.
+    pub(crate) link_phase_change: Option<(u16, u16)>,
+    /// Track and index link creation order.
+    pub(crate) link_creation_order: bool,
+    /// Track and index attribute creation order.
+    pub(crate) attr_creation_order: bool,
 }
 
 impl GroupNode {
@@ -19,6 +25,9 @@ impl GroupNode {
             children: vec![],
             attributes: vec![],
             attr_phase_change: None,
+            link_phase_change: None,
+            link_creation_order: false,
+            attr_creation_order: false,
         }
     }
 
@@ -107,6 +116,24 @@ impl GroupNode {
     /// When it drops below `min_dense`, it switches back.
     pub fn set_attr_phase_change(&mut self, max_compact: u16, min_dense: u16) -> &mut Self {
         self.attr_phase_change = Some((max_compact, min_dense));
+        self
+    }
+
+    /// Set non-default link storage phase change thresholds.
+    pub fn set_link_phase_change(&mut self, max_compact: u16, min_dense: u16) -> &mut Self {
+        self.link_phase_change = Some((max_compact, min_dense));
+        self
+    }
+
+    /// Enable link creation order tracking and indexing.
+    pub fn set_link_creation_order(&mut self) -> &mut Self {
+        self.link_creation_order = true;
+        self
+    }
+
+    /// Enable attribute creation order tracking and indexing.
+    pub fn set_attr_creation_order(&mut self) -> &mut Self {
+        self.attr_creation_order = true;
         self
     }
 

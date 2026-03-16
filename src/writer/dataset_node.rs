@@ -20,6 +20,10 @@ pub struct DatasetNode {
     pub(crate) early_alloc: bool,
     /// If set, the dataset references a committed (named) datatype by name.
     pub(crate) committed_type_name: Option<String>,
+    /// Non-default attribute phase change thresholds (max_compact, min_dense).
+    /// When set and attrs > max_compact, attributes are stored densely.
+    /// Values (8, 6) are the HDF5 defaults and do NOT set the OHDR flag.
+    pub(crate) attr_phase_change: Option<(u16, u16)>,
 }
 
 impl DatasetNode {
@@ -36,6 +40,7 @@ impl DatasetNode {
             vlen_elements: None,
             early_alloc: false,
             committed_type_name: None,
+            attr_phase_change: None,
         }
     }
 
@@ -52,6 +57,7 @@ impl DatasetNode {
             vlen_elements: Some(elements),
             early_alloc: false,
             committed_type_name: None,
+            attr_phase_change: None,
         }
     }
 
@@ -139,6 +145,15 @@ impl DatasetNode {
     /// selects the Implicit chunk index (no separate index structure).
     pub fn set_early_alloc(&mut self) -> &mut Self {
         self.early_alloc = true;
+        self
+    }
+
+    /// Set attribute phase change thresholds.
+    /// When the number of attributes exceeds `max_compact`, attributes are stored
+    /// densely (fractal heap + B-tree v2) instead of inline in the object header.
+    /// HDF5 defaults are (8, 6).
+    pub fn set_attr_phase_change(&mut self, max_compact: u16, min_dense: u16) -> &mut Self {
+        self.attr_phase_change = Some((max_compact, min_dense));
         self
     }
 }

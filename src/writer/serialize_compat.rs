@@ -118,7 +118,12 @@ pub(crate) fn write_tree_compat(
         if objects[i].index_meta_size > 0 {
             let index_addr = meta_addr + objects[i].ohdr_size as u64;
             if let ObjectKind::Group(ref g) = objects[i].kind {
-                if let Some(ref storage) = g.dense_attr_storage {
+                if g.link_creation_order {
+                    // Creation-order group: encode full interleaved meta blob.
+                    let meta_bytes = encode_creation_order_index_meta(&objects[i], g, opts)?;
+                    let istart = index_addr as usize;
+                    buf[istart..istart + meta_bytes.len()].copy_from_slice(&meta_bytes);
+                } else if let Some(ref storage) = g.dense_attr_storage {
                     let dense_bytes = crate::writer::dense_attrs::encode_dense_attr_structures(
                         storage, index_addr,
                     )?;
@@ -127,14 +132,38 @@ pub(crate) fn write_tree_compat(
                 }
             }
             if let ObjectKind::Dataset(ref d) = objects[i].kind {
+                if let Some(ref storage) = d.dense_attr_storage {
+                    // FHDB is in data region at data_addr + original_data_len.
+                    let fhdb_addr = data_addr + d.original_data_len as u64;
+                    let dense_bytes =
+                        crate::writer::dense_attrs::encode_dense_attr_structures_split(
+                            storage, index_addr, fhdb_addr,
+                        )?;
+                    let istart = index_addr as usize;
+                    buf[istart..istart + dense_bytes.len()].copy_from_slice(&dense_bytes);
+                }
                 if let Some(ref ci) = d.chunked_info {
+                    // Offset chunk index addr past any dense attr metadata.
+                    let dense_meta = d
+                        .dense_attr_storage
+                        .as_ref()
+                        .map(|s| {
+                            let sizes = crate::writer::dense_attrs::compute_dense_attr_sizes(s);
+                            sizes.frhp_size
+                                + sizes.bthd_size
+                                + sizes.fshd_size
+                                + sizes.btlf_size
+                                + sizes.fsse_size
+                        })
+                        .unwrap_or(0);
+                    let ci_addr = index_addr + dense_meta as u64;
                     let index_bytes = encode_chunk_index(
                         ci,
-                        index_addr,
+                        ci_addr,
                         data_addr,
                         objects[i].btree_v2_nodes_start,
                     )?;
-                    let istart = index_addr as usize;
+                    let istart = ci_addr as usize;
                     buf[istart..istart + index_bytes.len()].copy_from_slice(&index_bytes);
                 }
             }
@@ -143,8 +172,23 @@ pub(crate) fn write_tree_compat(
         // Write data block (with vlen heap ID fixup if needed).
         if !data.is_empty() {
             let ds = data_addr as usize;
-            if let ObjectKind::Dataset(ref d) = objects[i].kind {
-                if let Some(ref vlen_elems) = d.vlen_elements {
+            if let ObjectKind::Group(ref g) = objects[i].kind {
+                if g.link_creation_order {
+                    // Creation-order group: encode FHDBs in data region.
+                    let fhdbs = encode_creation_order_fhdbs(&objects[i], g, opts)?;
+                    buf[ds..ds + fhdbs.len()].copy_from_slice(&fhdbs);
+                }
+            } else if let ObjectKind::Dataset(ref d) = objects[i].kind {
+                if let Some(ref storage) = d.dense_attr_storage {
+                    // Write raw data first.
+                    buf[ds..ds + d.original_data_len].copy_from_slice(&data[..d.original_data_len]);
+                    // Encode and write FHDB at data_addr + original_data_len.
+                    let frhp_addr = meta_addr + objects[i].ohdr_size as u64;
+                    let fhdb =
+                        crate::writer::dense_attrs::encode_fhdb_standalone(storage, frhp_addr);
+                    let fhdb_start = ds + d.original_data_len;
+                    buf[fhdb_start..fhdb_start + fhdb.len()].copy_from_slice(&fhdb);
+                } else if let Some(ref vlen_elems) = d.vlen_elements {
                     // Rewrite the heap IDs with correct GCOL address.
                     let heap_id_bytes = vlen_elems.len() * 16;
                     let gcol_addr = data_addr + heap_id_bytes as u64;
@@ -273,6 +317,17 @@ struct GroupRef {
     /// Total byte size of the dense attribute structures placed after this OHDR.
     #[allow(dead_code)]
     dense_attr_meta_size: usize,
+    /// Non-default link phase change thresholds.
+    link_phase_change: Option<(u16, u16)>,
+    /// Track and index link creation order.
+    link_creation_order: bool,
+    /// Track and index attribute creation order.
+    attr_creation_order: bool,
+    /// Dense link storage (if links exceed compact threshold or phase_change=(0,0)).
+    dense_link_storage: Option<crate::writer::dense_attrs::DenseLinkStorage>,
+    /// For creation-order groups: child names in insertion order.
+    /// Children are encoded inline, not as separate objects.
+    crt_order_child_names: Vec<String>,
 }
 
 struct DatasetRef {
@@ -290,6 +345,12 @@ struct DatasetRef {
     committed_type_index: Option<usize>,
     /// Map of committed type names to object indices for attribute shared type refs.
     attr_committed_types: std::collections::HashMap<String, usize>,
+    /// Non-default attribute phase change thresholds.
+    attr_phase_change: Option<(u16, u16)>,
+    /// Dense attribute storage info (if attributes exceed compact threshold).
+    dense_attr_storage: Option<crate::writer::dense_attrs::DenseAttrStorage>,
+    /// Length of original dataset data (before FHDB was appended).
+    original_data_len: usize,
 }
 
 struct CommittedTypeRef {
@@ -332,6 +393,11 @@ fn flatten_tree(
 ) -> Result<usize> {
     let my_index = objects.len();
 
+    // Creation-order groups have a special interleaved metadata layout.
+    if group.link_creation_order {
+        return flatten_creation_order_group(group, opts, objects);
+    }
+
     // Determine if dense attribute storage is needed.
     let use_dense = if let Some((max_compact, _)) = group.attr_phase_change {
         group.attributes.len() > max_compact as usize
@@ -356,6 +422,11 @@ fn flatten_tree(
             attr_phase_change: group.attr_phase_change,
             dense_attr_storage: dense_storage,
             dense_attr_meta_size: dense_meta_size,
+            link_phase_change: group.link_phase_change,
+            link_creation_order: group.link_creation_order,
+            attr_creation_order: group.attr_creation_order,
+            dense_link_storage: None,
+            crt_order_child_names: vec![],
         }),
         ohdr_size: 0,
         meta_addr: 0,
@@ -502,6 +573,110 @@ fn flatten_tree(
     Ok(my_index)
 }
 
+/// Flatten a creation-order group into a single ObjectInfo.
+///
+/// Creation-order groups have an interleaved metadata layout where child OHDRs
+/// are interleaved with dense link/attr structures. Children are encoded inline
+/// rather than as separate objects.
+fn flatten_creation_order_group(
+    group: &GroupNode,
+    opts: &WriteOptions,
+    objects: &mut Vec<ObjectInfo>,
+) -> Result<usize> {
+    use crate::writer::dense_attrs::compute_dense_attr_crt_sizes;
+    use crate::writer::dense_attrs::compute_dense_attr_storage;
+    use crate::writer::dense_attrs::compute_dense_link_sizes;
+    use crate::writer::dense_attrs::compute_dense_link_storage;
+
+    let my_index = objects.len();
+    let child_names: Vec<String> = group.children.iter().map(|(n, _)| n.clone()).collect();
+    let n_children = child_names.len();
+
+    // Child groups are standard empty groups. Compute their OHDR size.
+    let child_target_chunk = compat_group_chunk_size(4, 8); // 120
+    let child_ohdr_size = ohdr_overhead(child_target_chunk, opts); // 147 with timestamps
+
+    // Dense link storage (placeholder addresses, recomputed in phase 4).
+    let placeholder_addrs: Vec<u64> = vec![0xDEAD_0000; n_children];
+    let link_storage = compute_dense_link_storage(&child_names, &placeholder_addrs);
+    let link_sizes = compute_dense_link_sizes(&link_storage);
+
+    // Dense attr storage.
+    let cloned_attrs: Vec<_> = group.attributes.iter().map(clone_attr).collect();
+    let attr_storage = compute_dense_attr_storage(&cloned_attrs)?;
+    let attr_crt_sizes = compute_dense_attr_crt_sizes(&attr_storage);
+
+    // Interleaved layout offsets (from start of index_meta, after ordered OHDR):
+    //   first_child_ohdr
+    //   link dense meta (FRHP + BTHD_name + BTHD_crt + FSHD + BTLF_name + BTLF_crt)
+    //   remaining child OHDRs
+    //   attr dense part1 (FRHP + BTHD_name + BTHD_crt)
+    //   OCHK (LinkInfo + AttrInfo)
+    //   attr dense part2 (FSHD + BTLF_name + BTLF_crt)
+    //   FSSE links
+    //   FSSE attrs
+    // Link dense meta excludes FSSE (it goes at the end separately).
+    let first_child = child_ohdr_size;
+    let link_meta_no_fsse = link_sizes.frhp_size
+        + link_sizes.bthd_name_size
+        + link_sizes.bthd_crt_size
+        + link_sizes.fshd_size
+        + link_sizes.btlf_name_size
+        + link_sizes.btlf_crt_size;
+    let remaining_children = (n_children - 1) * child_ohdr_size;
+    let attr_part1 =
+        attr_crt_sizes.frhp_size + attr_crt_sizes.bthd_name_size + attr_crt_sizes.bthd_crt_size;
+    let ochk_size = 4 + (6 + 34) + (6 + 28) + 4; // OCHK sig + LinkInfo + AttrInfo + cksum = 82
+    let attr_part2 =
+        attr_crt_sizes.fshd_size + attr_crt_sizes.btlf_name_size + attr_crt_sizes.btlf_crt_size;
+    let fsse_link = link_sizes.fsse_size;
+    let fsse_attr = attr_crt_sizes.fsse_size;
+
+    let index_meta_size = first_child
+        + link_meta_no_fsse
+        + remaining_children
+        + attr_part1
+        + ochk_size
+        + attr_part2
+        + fsse_link
+        + fsse_attr;
+
+    // Ordered group OHDR: creation-order flags, chunk_size=52.
+    // Messages (6-byte headers): CONT(22) + NIL(18) + GroupInfo(12) = 52
+    let ohdr_chunk_size = 52;
+    // Prefix: "OHDR"(4) + ver(1) + flags(1) + timestamps(16) + phase_change(4) + chunk_size(1) = 27
+    let ohdr_size = 27 + ohdr_chunk_size + 4; // 83
+
+    // Data region: FHDB attrs + FHDB links
+    let data_size = attr_crt_sizes.fhdb_size + link_sizes.fhdb_size;
+    let data = vec![0u8; data_size];
+
+    objects.push(ObjectInfo {
+        kind: ObjectKind::Group(GroupRef {
+            attributes: group.attributes.iter().map(clone_attr).collect(),
+            attr_phase_change: group.attr_phase_change,
+            dense_attr_storage: Some(attr_storage),
+            dense_attr_meta_size: 0,
+            link_phase_change: group.link_phase_change,
+            link_creation_order: true,
+            attr_creation_order: group.attr_creation_order,
+            dense_link_storage: Some(link_storage),
+            crt_order_child_names: child_names,
+        }),
+        ohdr_size,
+        meta_addr: 0,
+        data,
+        data_addr: 0,
+        child_indices: vec![],
+        target_chunk_size: None,
+        index_meta_size,
+        btree_v2_nodes_start: UNDEF_ADDR,
+        btree_v2_num_nodes: 0,
+    });
+
+    Ok(my_index)
+}
+
 fn flatten_dataset(
     ds: &DatasetNode,
     opts: &WriteOptions,
@@ -515,7 +690,7 @@ fn flatten_dataset(
     let is_chunked = matches!(ds.layout, StorageLayout::Chunked { .. });
 
     // Compute raw data (external data block) and optional chunked info.
-    let (raw_data, chunked_info) = if is_chunked {
+    let (mut raw_data, chunked_info) = if is_chunked {
         flatten_chunked_data(ds, opts)?
     } else if is_compact {
         (vec![], None)
@@ -544,6 +719,31 @@ fn flatten_dataset(
         (ds.data.clone(), None)
     };
 
+    // Determine if dense attribute storage is needed for this dataset.
+    let use_dense_ds = if let Some((max_compact, _)) = ds.attr_phase_change {
+        ds.attributes.len() > max_compact as usize
+    } else {
+        false
+    };
+
+    let (dense_storage, dense_meta_size) = if use_dense_ds {
+        let cloned_attrs: Vec<_> = ds.attributes.iter().map(|a| clone_attr(a)).collect();
+        let storage = crate::writer::dense_attrs::compute_dense_attr_storage(&cloned_attrs)?;
+        let sizes = crate::writer::dense_attrs::compute_dense_attr_sizes(&storage);
+        // Meta = FRHP+BTHD+FSHD+BTLF+FSSE (not FHDB — that goes in data region)
+        let meta_size =
+            sizes.frhp_size + sizes.bthd_size + sizes.fshd_size + sizes.btlf_size + sizes.fsse_size;
+        (Some(storage), meta_size)
+    } else {
+        (None, 0)
+    };
+
+    // For dense attrs, append FHDB placeholder to raw_data.
+    let original_data_len = raw_data.len();
+    if let Some(ref storage) = dense_storage {
+        raw_data.resize(raw_data.len() + storage.dblk_size, 0);
+    }
+
     // Compute dataset OHDR size using dummy data address.
     let (target_chunk, ohdr_size) = if is_compact {
         let messages = build_dataset_messages_dummy_compact(ds, opts)?;
@@ -564,6 +764,46 @@ fn flatten_dataset(
         };
         let chunk_for_overhead = tc.unwrap_or(real_msg_bytes);
         (tc, ohdr_overhead(chunk_for_overhead, opts))
+    } else if use_dense_ds {
+        // Dense attrs on dataset: mimic C library's incremental OHDR growth.
+        // Build messages WITHOUT inline attrs (only base + AINFO).
+        let messages = build_dataset_messages_dummy(
+            ds,
+            opts,
+            0xDEAD_BEEF_0000_0000,
+            committed_type_index.is_some(),
+        )?;
+        // base_msgs = all messages EXCEPT AttributeInfo and inline attrs
+        let base_msgs: usize = messages
+            .iter()
+            .filter(|(t, _, _)| {
+                *t != MessageType::AttributeInfo.as_u8() && *t != MessageType::Attribute.as_u8()
+            })
+            .map(|(_, b, _)| 4 + b.len())
+            .sum();
+        let max_compact = ds.attr_phase_change.map(|(mc, _)| mc as usize).unwrap_or(8);
+        let inline_attr_bytes: usize = ds
+            .attributes
+            .iter()
+            .take(max_compact)
+            .map(|a| 4 + encode_attribute(a).map(|b| b.len()).unwrap_or(0))
+            .sum();
+        let attr_info_size = messages
+            .iter()
+            .find(|(t, _, _)| *t == MessageType::AttributeInfo.as_u8())
+            .map(|(_, b, _)| 4 + b.len())
+            .unwrap_or(22);
+        let target = 256usize; // H5D_MINHDR_SIZE
+        let chunk_for_overhead = target.max(base_msgs + inline_attr_bytes) + attr_info_size;
+        let tc = Some(chunk_for_overhead);
+        // Dense datasets with default phase change (8,6) don't add phase_change to OHDR prefix
+        let is_default_phase = ds.attr_phase_change == Some((8, 6));
+        let phase_extra = if !is_default_phase && ds.attr_phase_change.is_some() {
+            4
+        } else {
+            0
+        };
+        (tc, ohdr_overhead(chunk_for_overhead, opts) + phase_extra)
     } else {
         let messages = build_dataset_messages_dummy(
             ds,
@@ -583,10 +823,12 @@ fn flatten_dataset(
     };
 
     // Compute index metadata size for chunk indices that need separate structures.
-    let index_meta_size = chunked_info
+    let mut index_meta_size = chunked_info
         .as_ref()
         .map(|ci| compute_index_meta_size(ci))
         .unwrap_or(0);
+    // Dense attr metadata (FRHP+BTHD+FSHD+BTLF+FSSE) placed after OHDR.
+    index_meta_size += dense_meta_size;
 
     // Build map of committed type names → object indices for shared-type attributes.
     let mut attr_ct_map = std::collections::HashMap::new();
@@ -614,6 +856,9 @@ fn flatten_dataset(
             chunked_info,
             committed_type_index,
             attr_committed_types: attr_ct_map,
+            attr_phase_change: ds.attr_phase_change,
+            dense_attr_storage: dense_storage,
+            original_data_len,
         }),
         ohdr_size,
         meta_addr: 0,
@@ -808,6 +1053,10 @@ fn encode_object_final(
     let target_chunk = obj.target_chunk_size;
 
     match &obj.kind {
+        ObjectKind::Group(g) if g.link_creation_order => {
+            // Creation-order group OHDR: CONT + NIL + GroupInfo, 6-byte headers.
+            encode_creation_order_ohdr(obj, g, opts)
+        }
         ObjectKind::Group(g) => {
             let mut messages: Vec<OhdrMsg> = Vec::new();
             messages.push((MessageType::LinkInfo.as_u8(), encode_link_info(), 0));
@@ -925,24 +1174,11 @@ fn encode_object_final(
                 } else if obj.data.is_empty() {
                     (UNDEF_ADDR, 0u64)
                 } else {
-                    (obj.data_addr, obj.data.len() as u64)
+                    // Use original_data_len to exclude FHDB from contiguous layout size.
+                    (obj.data_addr, d.original_data_len as u64)
                 };
                 (encode_contiguous_layout(data_addr, data_size), None)
             };
-
-            let mut attr_bodies: Vec<Vec<u8>> = Vec::new();
-            for attr in &d.attributes {
-                if let Some(ref ct_name) = attr.committed_type_name {
-                    if let Some(&ct_idx) = d.attr_committed_types.get(ct_name) {
-                        let ct_addr = objects[ct_idx].meta_addr;
-                        attr_bodies.push(encode_attribute_shared(attr, ct_addr)?);
-                    } else {
-                        attr_bodies.push(encode_attribute(attr)?);
-                    }
-                } else {
-                    attr_bodies.push(encode_attribute(attr)?);
-                }
-            }
 
             let mut messages: Vec<OhdrMsg> = vec![
                 (MessageType::Dataspace.as_u8(), ds_body, 0),
@@ -962,18 +1198,58 @@ fn encode_object_final(
                 layout_body,
                 layout_msg_flags,
             ));
-            if !attr_bodies.is_empty() {
+
+            if d.dense_attr_storage.is_some() {
+                // Dense attribute storage: AttrInfo pointing to FRHP + BTHD
+                // placed right after this OHDR.
+                let frhp_addr = obj.meta_addr + obj.ohdr_size as u64;
+                let storage = d.dense_attr_storage.as_ref().unwrap();
+                let sizes = crate::writer::dense_attrs::compute_dense_attr_sizes(storage);
+                let bthd_addr = frhp_addr + sizes.frhp_size as u64;
+                let attr_info_body = encode_attribute_info_addrs(frhp_addr, bthd_addr);
                 messages.push((
                     MessageType::AttributeInfo.as_u8(),
-                    encode_attribute_info(),
-                    0x04,
+                    attr_info_body,
+                    0x04, // not-shareable
                 ));
-            }
-            for body in attr_bodies {
-                messages.push((MessageType::Attribute.as_u8(), body, 0));
+            } else {
+                let mut attr_bodies: Vec<Vec<u8>> = Vec::new();
+                for attr in &d.attributes {
+                    if let Some(ref ct_name) = attr.committed_type_name {
+                        if let Some(&ct_idx) = d.attr_committed_types.get(ct_name) {
+                            let ct_addr = objects[ct_idx].meta_addr;
+                            attr_bodies.push(encode_attribute_shared(attr, ct_addr)?);
+                        } else {
+                            attr_bodies.push(encode_attribute(attr)?);
+                        }
+                    } else {
+                        attr_bodies.push(encode_attribute(attr)?);
+                    }
+                }
+                if !attr_bodies.is_empty() {
+                    messages.push((
+                        MessageType::AttributeInfo.as_u8(),
+                        encode_attribute_info(),
+                        0x04,
+                    ));
+                }
+                for body in attr_bodies {
+                    messages.push((MessageType::Attribute.as_u8(), body, 0));
+                }
             }
 
-            encode_object_header(&messages, opts, target_chunk)
+            // For dense datasets with non-default phase change, use phase change header.
+            let is_default_phase = d.attr_phase_change == Some((8, 6));
+            if d.attr_phase_change.is_some() && !is_default_phase {
+                encode_object_header_with_phase_change(
+                    &messages,
+                    opts,
+                    target_chunk,
+                    d.attr_phase_change,
+                )
+            } else {
+                encode_object_header(&messages, opts, target_chunk)
+            }
         }
         ObjectKind::CommittedDatatype(ct) => {
             // OHDR with a continuation message pointing to the OCHK.
@@ -1024,6 +1300,365 @@ fn encode_object_final(
             Ok(buf)
         }
     }
+}
+
+/// Encode the OHDR for a creation-order group.
+///
+/// The C library's allocation history produces: CONT + NIL + GroupInfo
+/// (LinkInfo was replaced with CONT+NIL; GroupInfo stays at its original position).
+/// chunk_size = 52, flags = 0x3C.
+fn encode_creation_order_ohdr(
+    obj: &ObjectInfo,
+    g: &GroupRef,
+    opts: &WriteOptions,
+) -> Result<Vec<u8>> {
+    use crate::writer::dense_attrs::compute_dense_attr_crt_sizes;
+    use crate::writer::dense_attrs::compute_dense_link_sizes;
+    use crate::writer::encode::encode_group_info_with_link_phase;
+
+    let n_children = g.crt_order_child_names.len();
+    let child_ohdr_size = {
+        let child_target = compat_group_chunk_size(4, 8);
+        ohdr_overhead(child_target, opts)
+    };
+
+    let link_sizes = compute_dense_link_sizes(g.dense_link_storage.as_ref().unwrap());
+    let attr_crt_sizes = compute_dense_attr_crt_sizes(g.dense_attr_storage.as_ref().unwrap());
+
+    // Compute OCHK address within the interleaved layout (link meta excludes FSSE).
+    let first_child = child_ohdr_size;
+    let link_meta_no_fsse = link_sizes.frhp_size
+        + link_sizes.bthd_name_size
+        + link_sizes.bthd_crt_size
+        + link_sizes.fshd_size
+        + link_sizes.btlf_name_size
+        + link_sizes.btlf_crt_size;
+    let remaining_children = (n_children - 1) * child_ohdr_size;
+    let attr_part1 =
+        attr_crt_sizes.frhp_size + attr_crt_sizes.bthd_name_size + attr_crt_sizes.bthd_crt_size;
+    let ochk_offset =
+        obj.ohdr_size + first_child + link_meta_no_fsse + remaining_children + attr_part1;
+    let ochk_addr = obj.meta_addr + ochk_offset as u64;
+    let ochk_size = 82u64;
+
+    // Build the OHDR manually with the exact C library message layout:
+    // CONT(6+16=22) + NIL(6+12=18) + GroupInfo(6+6=12) = 52 bytes of messages.
+    let chunk_size: usize = 52;
+    let (max_compact, min_dense) = g.attr_phase_change.unwrap_or((0, 0));
+
+    let mut buf = Vec::with_capacity(83);
+
+    // Prefix: OHDR + ver + flags + timestamps + phase_change + chunk_size
+    buf.extend_from_slice(b"OHDR");
+    buf.push(2); // version
+    buf.push(0x3C); // flags: bits 2,3,4,5
+
+    if let Some((at, mt, ct, bt)) = opts.timestamps {
+        buf.extend_from_slice(&at.to_le_bytes());
+        buf.extend_from_slice(&mt.to_le_bytes());
+        buf.extend_from_slice(&ct.to_le_bytes());
+        buf.extend_from_slice(&bt.to_le_bytes());
+    }
+
+    buf.extend_from_slice(&max_compact.to_le_bytes());
+    buf.extend_from_slice(&min_dense.to_le_bytes());
+    buf.push(chunk_size as u8); // chunk_size < 256
+
+    // Message 1: CONT (6-byte header + 16-byte body)
+    buf.push(MessageType::ObjectHeaderContinuation.as_u8());
+    buf.extend_from_slice(&16u16.to_le_bytes());
+    buf.push(0x00); // flags
+    buf.extend_from_slice(&0u16.to_le_bytes()); // creation_order
+    buf.extend_from_slice(&ochk_addr.to_le_bytes());
+    buf.extend_from_slice(&ochk_size.to_le_bytes());
+
+    // Message 2: NIL (6-byte header + 12-byte body)
+    buf.push(0x00); // NIL type
+    buf.extend_from_slice(&12u16.to_le_bytes());
+    buf.push(0x00);
+    buf.extend_from_slice(&0u16.to_le_bytes()); // creation_order
+    buf.resize(buf.len() + 12, 0); // 12 zero bytes
+
+    // Message 3: GroupInfo (6-byte header + 6-byte body)
+    let group_info_body = encode_group_info_with_link_phase(
+        g.link_phase_change.map(|(mc, _)| mc).unwrap_or(0),
+        g.link_phase_change.map(|(_, md)| md).unwrap_or(0),
+    );
+    buf.push(MessageType::GroupInfo.as_u8());
+    buf.extend_from_slice(&(group_info_body.len() as u16).to_le_bytes());
+    buf.push(0x01); // constant flag
+    buf.extend_from_slice(&0u16.to_le_bytes()); // creation_order
+    buf.extend_from_slice(&group_info_body);
+
+    // Checksum
+    let cksum = crate::checksum::lookup3(&buf);
+    buf.extend_from_slice(&cksum.to_le_bytes());
+
+    debug_assert_eq!(buf.len(), 83);
+    Ok(buf)
+}
+
+/// Encode the full interleaved index metadata for a creation-order group.
+///
+/// Layout:
+///   child0_ohdr | link_dense_meta | child1..N_ohdrs | attr_part1 | ochk | attr_part2 | fsse_link | fsse_attr
+fn encode_creation_order_index_meta(
+    obj: &ObjectInfo,
+    g: &GroupRef,
+    opts: &WriteOptions,
+) -> Result<Vec<u8>> {
+    use crate::writer::dense_attrs::compute_dense_attr_crt_sizes;
+    use crate::writer::dense_attrs::compute_dense_link_sizes;
+    use crate::writer::dense_attrs::compute_dense_link_storage;
+    use crate::writer::dense_attrs::encode_attr_crt_fsse;
+    use crate::writer::dense_attrs::encode_dense_attr_crt_part1;
+    use crate::writer::dense_attrs::encode_dense_attr_crt_part2;
+    use crate::writer::dense_attrs::encode_dense_link_meta;
+    use crate::writer::dense_attrs::encode_link_fsse;
+    use crate::writer::encode::encode_attribute_info_dense_crt;
+    use crate::writer::encode::encode_link_info_dense_crt;
+    use crate::writer::encode::encode_ochk_creation_order;
+
+    let n_children = g.crt_order_child_names.len();
+    let child_ohdr_size = {
+        let child_target = compat_group_chunk_size(4, 8);
+        ohdr_overhead(child_target, opts)
+    };
+
+    let attr_storage = g.dense_attr_storage.as_ref().unwrap();
+    let link_sizes = compute_dense_link_sizes(g.dense_link_storage.as_ref().unwrap());
+    let attr_crt_sizes = compute_dense_attr_crt_sizes(attr_storage);
+
+    // Compute section offsets (from start of index_meta, i.e. after ordered OHDR).
+    let base_addr = obj.meta_addr + obj.ohdr_size as u64;
+
+    let link_meta_no_fsse = link_sizes.frhp_size
+        + link_sizes.bthd_name_size
+        + link_sizes.bthd_crt_size
+        + link_sizes.fshd_size
+        + link_sizes.btlf_name_size
+        + link_sizes.btlf_crt_size;
+
+    let first_child_offset = 0usize;
+    let link_meta_offset = first_child_offset + child_ohdr_size;
+    let remaining_children_offset = link_meta_offset + link_meta_no_fsse;
+    let remaining_children_size = (n_children - 1) * child_ohdr_size;
+    let attr_part1_offset = remaining_children_offset + remaining_children_size;
+    let attr_part1_size =
+        attr_crt_sizes.frhp_size + attr_crt_sizes.bthd_name_size + attr_crt_sizes.bthd_crt_size;
+    let ochk_offset = attr_part1_offset + attr_part1_size;
+    let ochk_size = 82usize;
+    let attr_part2_offset = ochk_offset + ochk_size;
+    let attr_part2_size =
+        attr_crt_sizes.fshd_size + attr_crt_sizes.btlf_name_size + attr_crt_sizes.btlf_crt_size;
+    let fsse_link_offset = attr_part2_offset + attr_part2_size;
+    let fsse_attr_offset = fsse_link_offset + link_sizes.fsse_size;
+
+    // Compute addresses.
+    let child_addrs: Vec<u64> = (0..n_children)
+        .map(|i| {
+            if i == 0 {
+                base_addr + first_child_offset as u64
+            } else {
+                base_addr + remaining_children_offset as u64 + ((i - 1) * child_ohdr_size) as u64
+            }
+        })
+        .collect();
+
+    let link_meta_addr = base_addr + link_meta_offset as u64;
+    let attr_frhp_addr = base_addr + attr_part1_offset as u64;
+    let attr_fshd_addr = base_addr + attr_part2_offset as u64;
+    let fsse_link_addr = base_addr + fsse_link_offset as u64;
+    let fsse_attr_addr = base_addr + fsse_attr_offset as u64;
+
+    // FHDB addresses (in data region).
+    let fhdb_attr_addr = obj.data_addr;
+    let fhdb_link_addr = obj.data_addr + attr_crt_sizes.fhdb_size as u64;
+
+    // Recompute dense link storage with real child addresses.
+    let link_storage = compute_dense_link_storage(&g.crt_order_child_names, &child_addrs);
+
+    // Link FSHD address within link_meta.
+    let link_fshd_addr = link_meta_addr
+        + link_sizes.frhp_size as u64
+        + link_sizes.bthd_name_size as u64
+        + link_sizes.bthd_crt_size as u64;
+
+    // --- Build the output buffer ---
+    let total_size = obj.index_meta_size;
+    let mut buf = vec![0u8; total_size];
+
+    // 1. First child OHDR
+    let child0_ohdr = encode_empty_group_ohdr(opts)?;
+    buf[first_child_offset..first_child_offset + child_ohdr_size].copy_from_slice(&child0_ohdr);
+
+    // 2. Link dense meta (FRHP + BTHD_name + BTHD_crt + FSHD + BTLF_name + BTLF_crt)
+    let link_meta_bytes = encode_dense_link_meta(
+        &link_storage,
+        link_meta_addr,
+        fhdb_link_addr,
+        fsse_link_addr,
+    )?;
+    buf[link_meta_offset..link_meta_offset + link_meta_bytes.len()]
+        .copy_from_slice(&link_meta_bytes);
+
+    // 3. Remaining child OHDRs
+    for i in 1..n_children {
+        let child_ohdr = encode_empty_group_ohdr(opts)?;
+        let off = remaining_children_offset + (i - 1) * child_ohdr_size;
+        buf[off..off + child_ohdr_size].copy_from_slice(&child_ohdr);
+    }
+
+    // 4. Attr dense part1 (FRHP + BTHD_name + BTHD_crt)
+    let attr_part1_bytes = encode_dense_attr_crt_part1(
+        attr_storage,
+        attr_frhp_addr,
+        fhdb_attr_addr,
+        attr_fshd_addr,
+        fsse_attr_addr,
+    )?;
+    buf[attr_part1_offset..attr_part1_offset + attr_part1_bytes.len()]
+        .copy_from_slice(&attr_part1_bytes);
+
+    // 5. OCHK (LinkInfo + AttrInfo)
+    // LinkInfo addresses: link FRHP, link BTHD_name, link BTHD_crt
+    let link_frhp_addr = link_meta_addr;
+    let link_bthd_name_addr = link_frhp_addr + link_sizes.frhp_size as u64;
+    let link_bthd_crt_addr = link_bthd_name_addr + link_sizes.bthd_name_size as u64;
+    let link_info_body = encode_link_info_dense_crt(
+        link_frhp_addr,
+        link_bthd_name_addr,
+        link_bthd_crt_addr,
+        n_children as u64,
+    );
+    // AttrInfo addresses: attr FRHP, attr BTHD_name, attr BTHD_crt
+    let attr_bthd_name_addr = attr_frhp_addr + attr_crt_sizes.frhp_size as u64;
+    let attr_bthd_crt_addr = attr_bthd_name_addr + attr_crt_sizes.bthd_name_size as u64;
+    let attr_info_body = encode_attribute_info_dense_crt(
+        attr_frhp_addr,
+        attr_bthd_name_addr,
+        attr_bthd_crt_addr,
+        g.attributes.len() as u16,
+    );
+    let ochk_messages: Vec<OhdrMsg> = vec![
+        (MessageType::LinkInfo.as_u8(), link_info_body, 0x00),
+        (
+            MessageType::AttributeInfo.as_u8(),
+            attr_info_body,
+            0x04, // not-shareable
+        ),
+    ];
+    let ochk_bytes = encode_ochk_creation_order(&ochk_messages);
+    buf[ochk_offset..ochk_offset + ochk_bytes.len()].copy_from_slice(&ochk_bytes);
+
+    // 6. Attr dense part2 (FSHD + BTLF_name + BTLF_crt)
+    let attr_part2_bytes =
+        encode_dense_attr_crt_part2(attr_storage, attr_fshd_addr, fsse_attr_addr)?;
+    buf[attr_part2_offset..attr_part2_offset + attr_part2_bytes.len()]
+        .copy_from_slice(&attr_part2_bytes);
+
+    // 7. FSSE links
+    let fsse_link_bytes = encode_link_fsse(&link_storage, link_fshd_addr);
+    buf[fsse_link_offset..fsse_link_offset + fsse_link_bytes.len()]
+        .copy_from_slice(&fsse_link_bytes);
+
+    // 8. FSSE attrs
+    let fsse_attr_bytes = encode_attr_crt_fsse(attr_storage, attr_fshd_addr);
+    buf[fsse_attr_offset..fsse_attr_offset + fsse_attr_bytes.len()]
+        .copy_from_slice(&fsse_attr_bytes);
+
+    Ok(buf)
+}
+
+/// Encode a standard empty group OHDR (with timestamps, for creation-order children).
+fn encode_empty_group_ohdr(opts: &WriteOptions) -> Result<Vec<u8>> {
+    let messages: Vec<OhdrMsg> = vec![
+        (MessageType::LinkInfo.as_u8(), encode_link_info(), 0),
+        (MessageType::GroupInfo.as_u8(), encode_group_info(), 0x01),
+    ];
+    let target = compat_group_chunk_size(4, 8);
+    encode_object_header(&messages, opts, Some(target))
+}
+
+/// Compute child OHDR addresses for a creation-order group.
+fn compute_crt_order_child_addrs(obj: &ObjectInfo, g: &GroupRef, opts: &WriteOptions) -> Vec<u64> {
+    let child_ohdr_size = {
+        let child_target = compat_group_chunk_size(4, 8);
+        ohdr_overhead(child_target, opts)
+    };
+    let link_sizes = crate::writer::dense_attrs::compute_dense_link_sizes(
+        g.dense_link_storage.as_ref().unwrap(),
+    );
+    let n = g.crt_order_child_names.len();
+    let base_addr = obj.meta_addr + obj.ohdr_size as u64;
+
+    let link_meta_no_fsse = (link_sizes.frhp_size
+        + link_sizes.bthd_name_size
+        + link_sizes.bthd_crt_size
+        + link_sizes.fshd_size
+        + link_sizes.btlf_name_size
+        + link_sizes.btlf_crt_size) as u64;
+    let first_child_offset = 0u64;
+    let link_meta_offset = child_ohdr_size as u64;
+    let remaining_children_offset = link_meta_offset + link_meta_no_fsse;
+
+    (0..n)
+        .map(|i| {
+            if i == 0 {
+                base_addr + first_child_offset
+            } else {
+                base_addr + remaining_children_offset + ((i - 1) * child_ohdr_size) as u64
+            }
+        })
+        .collect()
+}
+
+/// Encode FHDBs (fractal heap direct blocks) for the data region of a creation-order group.
+/// Returns FHDB_attrs + FHDB_links concatenated.
+fn encode_creation_order_fhdbs(
+    obj: &ObjectInfo,
+    g: &GroupRef,
+    opts: &WriteOptions,
+) -> Result<Vec<u8>> {
+    use crate::writer::dense_attrs::compute_dense_attr_crt_sizes;
+    use crate::writer::dense_attrs::compute_dense_link_sizes;
+    use crate::writer::dense_attrs::compute_dense_link_storage;
+    use crate::writer::dense_attrs::encode_fhdb_standalone;
+    use crate::writer::dense_attrs::encode_link_fhdb;
+
+    let attr_storage = g.dense_attr_storage.as_ref().unwrap();
+    let attr_crt_sizes = compute_dense_attr_crt_sizes(attr_storage);
+    let link_sizes = compute_dense_link_sizes(g.dense_link_storage.as_ref().unwrap());
+    let child_addrs = compute_crt_order_child_addrs(obj, g, opts);
+    let child_ohdr_size = {
+        let child_target = compat_group_chunk_size(4, 8);
+        ohdr_overhead(child_target, opts)
+    };
+    let n_children = g.crt_order_child_names.len();
+
+    // Attr FRHP addr: base + first_child + link_meta(no fsse) + remaining_children
+    let link_meta_no_fsse = (link_sizes.frhp_size
+        + link_sizes.bthd_name_size
+        + link_sizes.bthd_crt_size
+        + link_sizes.fshd_size
+        + link_sizes.btlf_name_size
+        + link_sizes.btlf_crt_size) as u64;
+    let base_addr = obj.meta_addr + obj.ohdr_size as u64;
+    let attr_frhp_addr = base_addr
+        + child_ohdr_size as u64
+        + link_meta_no_fsse
+        + ((n_children - 1) * child_ohdr_size) as u64;
+    let fhdb_attr = encode_fhdb_standalone(attr_storage, attr_frhp_addr);
+
+    // Link FRHP addr: base + first_child
+    let link_frhp_addr = base_addr + child_ohdr_size as u64;
+    let link_storage = compute_dense_link_storage(&g.crt_order_child_names, &child_addrs);
+    let fhdb_link = encode_link_fhdb(&link_storage, link_frhp_addr);
+
+    let mut buf = Vec::with_capacity(fhdb_attr.len() + fhdb_link.len());
+    buf.extend_from_slice(&fhdb_attr);
+    buf.extend_from_slice(&fhdb_link);
+    Ok(buf)
 }
 
 fn build_group_messages_dummy(

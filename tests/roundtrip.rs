@@ -965,3 +965,33 @@ fn write_vlen_sequence() {
         .collect();
     assert_eq!(s2, vec![42]);
 }
+
+// ── LZF compression roundtrip ──
+
+#[test]
+fn write_lzf() {
+    let mut w = FileWriter::new();
+    // 100 i32 values with a pattern that compresses well
+    let values: Vec<i32> = (0..100).collect();
+    let data: Vec<u8> = values.iter().flat_map(|x| x.to_le_bytes()).collect();
+    let ds = w
+        .root_mut()
+        .add_dataset("data", Datatype::native_i32(), &[100], data);
+    ds.set_layout(StorageLayout::Chunked {
+        chunk_dims: vec![100],
+        filters: vec![hdf5_io::writer::ChunkFilter::Lzf],
+    });
+
+    let bytes = w.to_bytes().unwrap();
+    let file = File::from_bytes(bytes.into_boxed_slice()).unwrap();
+    let root = file.root_group().unwrap();
+    let ds = root.dataset("data").unwrap();
+    assert_eq!(ds.shape().unwrap(), vec![100]);
+
+    let raw = ds.read_raw().unwrap();
+    let read_values: Vec<i32> = raw
+        .chunks_exact(4)
+        .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    assert_eq!(read_values, values);
+}

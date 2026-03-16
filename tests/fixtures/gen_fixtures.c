@@ -5,7 +5,209 @@
  */
 #include "hdf5.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+
+/* ── Minimal LZF compression/decompression (Marc Lehmann's algorithm) ──
+ * Used to register as HDF5 third-party filter ID 32000 (same as h5py). */
+
+#define LZF_HLOG 16
+#define LZF_HTAB_SIZE (1 << LZF_HLOG)
+
+static unsigned int
+lzf_compress(const void *const in_data, unsigned int in_len,
+             void *out_data, unsigned int out_len)
+{
+    const unsigned char *ip = (const unsigned char *)in_data;
+    unsigned char *op = (unsigned char *)out_data;
+    const unsigned char *in_end = ip + in_len;
+    unsigned char *out_end = op + out_len;
+    const unsigned char *ref;
+
+    unsigned int *htab;
+    htab = (unsigned int *)calloc(LZF_HTAB_SIZE, sizeof(unsigned int));
+    if (!htab) return 0;
+
+    const unsigned char *lit_start = ip;
+    unsigned char *lit_op = op++; /* placeholder for first literal ctrl */
+
+    if (in_len < 4) goto literal_flush;
+    ip++;
+
+    for (;;) {
+        if (ip >= in_end - 2) break;
+
+        unsigned int v = ip[0] | ((unsigned int)ip[1] << 8) | ((unsigned int)ip[2] << 16);
+        unsigned int h = ((v >> 1) ^ v);
+        h = (h >> 3 ^ h << 5 ^ h >> 12) & (LZF_HTAB_SIZE - 1);
+        ref = (const unsigned char *)in_data + htab[h];
+        htab[h] = (unsigned int)(ip - (const unsigned char *)in_data);
+
+        unsigned int off = (unsigned int)(ip - ref);
+        if (off > 0 && off < 8192 && ref >= (const unsigned char *)in_data
+            && ref + 2 < in_end
+            && ref[0] == ip[0] && ref[1] == ip[1] && ref[2] == ip[2])
+        {
+            /* Flush pending literals */
+            unsigned int lit_len = (unsigned int)(ip - lit_start);
+            if (lit_len > 0) {
+                const unsigned char *lp = lit_start;
+                while (lp < ip) {
+                    unsigned int run = (unsigned int)(ip - lp);
+                    if (run > 32) run = 32;
+                    if (op + 1 + run > out_end) { free(htab); return 0; }
+                    *lit_op = (unsigned char)(run - 1);
+                    memcpy(op, lp, run);
+                    op += run;
+                    lp += run;
+                    if (lp < ip) lit_op = op++;
+                }
+            }
+
+            /* Find match length */
+            unsigned int len = 3;
+            unsigned int maxlen = (unsigned int)(in_end - ip);
+            if (maxlen > 264) maxlen = 264;
+            while (len < maxlen && ref[len] == ip[len]) len++;
+
+            unsigned int offset = off - 1;
+            if (len <= 8) {
+                if (op + 2 > out_end) { free(htab); return 0; }
+                *op++ = (unsigned char)(((len - 2) << 5) | (offset >> 8));
+                *op++ = (unsigned char)(offset & 0xFF);
+            } else {
+                if (op + 3 > out_end) { free(htab); return 0; }
+                *op++ = (unsigned char)((7 << 5) | (offset >> 8));
+                *op++ = (unsigned char)(len - 9);
+                *op++ = (unsigned char)(offset & 0xFF);
+            }
+
+            ip += len;
+            lit_start = ip;
+            if (op >= out_end) { free(htab); return 0; }
+            lit_op = op++;
+
+            if (ip < in_end - 2) {
+                v = ip[0] | ((unsigned int)ip[1] << 8) | ((unsigned int)ip[2] << 16);
+                h = ((v >> 1) ^ v);
+                h = (h >> 3 ^ h << 5 ^ h >> 12) & (LZF_HTAB_SIZE - 1);
+                htab[h] = (unsigned int)(ip - (const unsigned char *)in_data);
+            }
+        } else {
+            ip++;
+        }
+    }
+
+literal_flush:;
+    /* Flush remaining */
+    if (lit_start < in_end) {
+        const unsigned char *lp = lit_start;
+        const unsigned char *end = in_end;
+        while (lp < end) {
+            unsigned int run = (unsigned int)(end - lp);
+            if (run > 32) run = 32;
+            if (op + 1 + run > out_end) { free(htab); return 0; }
+            *lit_op = (unsigned char)(run - 1);
+            memcpy(op, lp, run);
+            op += run;
+            lp += run;
+            if (lp < end) lit_op = op++;
+        }
+    } else {
+        /* No remaining literals — remove unused ctrl placeholder */
+        op--;
+    }
+
+    free(htab);
+    return (unsigned int)(op - (unsigned char *)out_data);
+}
+
+static unsigned int
+lzf_decompress(const void *const in_data, unsigned int in_len,
+               void *out_data, unsigned int out_len)
+{
+    const unsigned char *ip = (const unsigned char *)in_data;
+    unsigned char *op = (unsigned char *)out_data;
+    const unsigned char *in_end = ip + in_len;
+    unsigned char *out_end = op + out_len;
+
+    while (ip < in_end) {
+        unsigned int ctrl = *ip++;
+        if (ctrl < 32) {
+            unsigned int len = ctrl + 1;
+            if (ip + len > in_end || op + len > out_end) return 0;
+            memcpy(op, ip, len);
+            ip += len;
+            op += len;
+        } else {
+            unsigned int len = (ctrl >> 5) + 2;
+            if (len == 9) {
+                if (ip >= in_end) return 0;
+                len += *ip++;
+            }
+            if (ip >= in_end) return 0;
+            unsigned int offset = ((ctrl & 0x1f) << 8) | *ip++;
+            unsigned char *ref = op - offset - 1;
+            if (ref < (unsigned char *)out_data || op + len > out_end) return 0;
+            /* byte-by-byte copy (may overlap) */
+            for (unsigned int i = 0; i < len; i++) *op++ = ref[i];
+        }
+    }
+    return (unsigned int)(op - (unsigned char *)out_data);
+}
+
+/* HDF5 filter callback for LZF (filter ID 32000). */
+#define H5Z_FILTER_LZF 32000
+
+static size_t
+lzf_filter(unsigned int flags, size_t cd_nelmts, const unsigned int cd_values[],
+           size_t nbytes, size_t *buf_size, void **buf)
+{
+    if (flags & H5Z_FLAG_REVERSE) {
+        /* Decompress */
+        size_t out_size = cd_nelmts >= 3 ? cd_values[2] : nbytes * 4;
+        void *outbuf = malloc(out_size);
+        if (!outbuf) return 0;
+        unsigned int result = lzf_decompress(*buf, (unsigned int)nbytes,
+                                              outbuf, (unsigned int)out_size);
+        if (result == 0) { free(outbuf); return 0; }
+        free(*buf);
+        *buf = outbuf;
+        *buf_size = out_size;
+        return (size_t)result;
+    } else {
+        /* Compress */
+        size_t out_max = nbytes + (nbytes / 16) + 64 + 3;
+        void *outbuf = malloc(out_max);
+        if (!outbuf) return 0;
+        unsigned int result = lzf_compress(*buf, (unsigned int)nbytes,
+                                            outbuf, (unsigned int)out_max);
+        if (result == 0 || result >= nbytes) {
+            /* Compression didn't help — store uncompressed */
+            free(outbuf);
+            return nbytes;
+        }
+        free(*buf);
+        *buf = outbuf;
+        *buf_size = out_max;
+        return (size_t)result;
+    }
+}
+
+static void register_lzf_filter(void)
+{
+    H5Z_class2_t filter_class = {
+        .version = H5Z_CLASS_T_VERS,
+        .id = H5Z_FILTER_LZF,
+        .encoder_present = 1,
+        .decoder_present = 1,
+        .name = "lzf",
+        .can_apply = NULL,
+        .set_local = NULL,
+        .filter = lzf_filter,
+    };
+    H5Zregister(&filter_class);
+}
 
 /* Create a minimal file with superblock v2, one contiguous dataset of f64. */
 static void create_simple_contiguous(const char *filename)
@@ -1260,6 +1462,41 @@ static void create_compound_complex_members(const char *filename)
  * the dataset is extended and new data is written. After clean close the
  * SWMR flags are cleared, but the file retains superblock v3 layout and
  * data written during the SWMR session. */
+/* LZF-compressed chunked dataset (third-party filter ID 32000).
+ * Simple: 32 i32 values in a single chunk, V18 superblock, layout v3 (B-tree v1). */
+static void create_lzf(const char *filename)
+{
+    register_lzf_filter();
+
+    hid_t fapl = H5Pcreate(H5P_FILE_ACCESS);
+    H5Pset_libver_bounds(fapl, H5F_LIBVER_V18, H5F_LIBVER_V18);
+
+    hid_t file = H5Fcreate(filename, H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
+
+    hsize_t dims[1] = {32};
+    hsize_t chunk_dims[1] = {32};
+    hid_t space = H5Screate_simple(1, dims, NULL);
+
+    hid_t dcpl = H5Pcreate(H5P_DATASET_CREATE);
+    H5Pset_chunk(dcpl, 1, chunk_dims);
+    /* Add LZF filter (ID 32000) with no client data */
+    H5Pset_filter(dcpl, H5Z_FILTER_LZF, H5Z_FLAG_OPTIONAL, 0, NULL);
+
+    hid_t dset = H5Dcreate2(file, "data", H5T_NATIVE_INT32, space,
+                             H5P_DEFAULT, dcpl, H5P_DEFAULT);
+
+    int32_t values[32];
+    for (int i = 0; i < 32; i++) values[i] = i / 4;  /* repeated values → compressible */
+    H5Dwrite(dset, H5T_NATIVE_INT32, H5S_ALL, H5S_ALL, H5P_DEFAULT, values);
+
+    H5Dclose(dset);
+    H5Sclose(space);
+    H5Pclose(dcpl);
+    H5Fclose(file);
+    H5Pclose(fapl);
+    printf("Created %s\n", filename);
+}
+
 static void create_swmr(const char *filename)
 {
     hid_t fapl = H5Pcreate(H5P_FILE_ACCESS);
@@ -1359,5 +1596,6 @@ int main(void)
     create_gcol_free_space("gcol_free_space.h5");
     create_compound_complex_members("compound_complex_members.h5");
     create_swmr("swmr.h5");
+    create_lzf("lzf_c.h5");
     return 0;
 }

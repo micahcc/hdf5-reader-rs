@@ -480,6 +480,202 @@ pub(crate) fn encode_link(name: &str, target_addr: u64) -> Vec<u8> {
     buf
 }
 
+/// Encode a link message body with creation order for storage in a fractal heap.
+pub(crate) fn encode_link_body_crt_order(
+    name: &str,
+    target_addr: u64,
+    creation_order: u64,
+) -> Vec<u8> {
+    let name_bytes = name.as_bytes();
+    let name_len = name_bytes.len();
+    let (name_enc_bits, name_enc_size) = if name_len <= 0xFF {
+        (0u8, 1usize)
+    } else if name_len <= 0xFFFF {
+        (1u8, 2usize)
+    } else {
+        (2u8, 4usize)
+    };
+    // flags: bit 2 = creation order present, bits 4-5 = name length size encoding
+    let flags = 0x04 | (name_enc_bits << 4);
+    let mut buf = Vec::with_capacity(2 + 8 + name_enc_size + name_len + 8);
+    buf.push(1); // version
+    buf.push(flags);
+    buf.extend_from_slice(&creation_order.to_le_bytes());
+    match name_enc_size {
+        1 => buf.push(name_len as u8),
+        2 => buf.extend_from_slice(&(name_len as u16).to_le_bytes()),
+        4 => buf.extend_from_slice(&(name_len as u32).to_le_bytes()),
+        _ => unreachable!(),
+    }
+    buf.extend_from_slice(name_bytes);
+    buf.extend_from_slice(&target_addr.to_le_bytes());
+    buf
+}
+
+/// Encode LinkInfo message with dense addresses and creation order.
+pub(crate) fn encode_link_info_dense_crt(
+    frhp_addr: u64,
+    bthd_name_addr: u64,
+    bthd_crt_addr: u64,
+    max_creation_order: u64,
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(34);
+    buf.push(0); // version
+    buf.push(0x03); // flags: bit 0 = creation order tracked, bit 1 = creation order indexed
+    buf.extend_from_slice(&max_creation_order.to_le_bytes());
+    buf.extend_from_slice(&frhp_addr.to_le_bytes());
+    buf.extend_from_slice(&bthd_name_addr.to_le_bytes());
+    buf.extend_from_slice(&bthd_crt_addr.to_le_bytes());
+    buf
+}
+
+/// Encode AttributeInfo message with dense addresses and creation order.
+pub(crate) fn encode_attribute_info_dense_crt(
+    frhp_addr: u64,
+    bthd_name_addr: u64,
+    bthd_crt_addr: u64,
+    max_creation_order: u16,
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(28);
+    buf.push(0); // version
+    buf.push(0x03); // flags: bit 0 = creation order tracked, bit 1 = creation order indexed
+    buf.extend_from_slice(&max_creation_order.to_le_bytes());
+    buf.extend_from_slice(&frhp_addr.to_le_bytes());
+    buf.extend_from_slice(&bthd_name_addr.to_le_bytes());
+    buf.extend_from_slice(&bthd_crt_addr.to_le_bytes());
+    buf
+}
+
+/// Encode GroupInfo message with link phase change thresholds.
+pub(crate) fn encode_group_info_with_link_phase(max_compact: u16, min_dense: u16) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(6);
+    buf.push(0); // version
+    buf.push(0x01); // flags: bit 0 = link phase change stored
+    buf.extend_from_slice(&max_compact.to_le_bytes());
+    buf.extend_from_slice(&min_dense.to_le_bytes());
+    buf
+}
+
+/// Encode an OHDR with creation order tracking.
+///
+/// Creation order adds bits 2+3 to flags and makes message headers 6 bytes
+/// (type(1) + size(2) + flags(1) + creation_order(2)).
+pub(crate) fn encode_object_header_creation_order(
+    messages: &[OhdrMsg],
+    opts: &WriteOptions,
+    target_chunk_size: Option<usize>,
+    attr_phase_change: Option<(u16, u16)>,
+) -> Result<Vec<u8>> {
+    // With creation order, each message header is 6 bytes instead of 4.
+    let real_msg_bytes: usize = messages.iter().map(|(_, b, _)| 6 + b.len()).sum();
+    let total_msg_bytes = if let Some(target) = target_chunk_size {
+        assert!(
+            target >= real_msg_bytes,
+            "target_chunk_size ({target}) < real messages ({real_msg_bytes})"
+        );
+        target
+    } else {
+        real_msg_bytes
+    };
+
+    let ts_extra = if opts.timestamps.is_some() { 16 } else { 0 };
+    let base_flags: u8 = if opts.timestamps.is_some() { 0x20 } else { 0 };
+    // Add bits 2+3 for creation order tracked+indexed
+    let mut flags = base_flags | 0x04 | 0x08;
+    // Add bit 4 for attr phase change if present
+    let phase_extra = if attr_phase_change.is_some() {
+        flags |= 0x10;
+        4
+    } else {
+        0
+    };
+    // Chunk size encoding
+    flags |= if total_msg_bytes <= 0xFF {
+        0x00
+    } else if total_msg_bytes <= 0xFFFF {
+        0x01
+    } else {
+        0x02
+    };
+
+    let cs_size = match flags & 0x03 {
+        0x00 => 1,
+        0x01 => 2,
+        _ => 4,
+    };
+    let prefix_size = 6 + ts_extra + phase_extra + cs_size;
+
+    let mut buf = Vec::with_capacity(prefix_size + total_msg_bytes + 4);
+    buf.extend_from_slice(b"OHDR");
+    buf.push(2);
+    buf.push(flags);
+
+    if let Some((at, mt, ct, bt)) = opts.timestamps {
+        buf.extend_from_slice(&at.to_le_bytes());
+        buf.extend_from_slice(&mt.to_le_bytes());
+        buf.extend_from_slice(&ct.to_le_bytes());
+        buf.extend_from_slice(&bt.to_le_bytes());
+    }
+
+    if let Some((mc, md)) = attr_phase_change {
+        buf.extend_from_slice(&mc.to_le_bytes());
+        buf.extend_from_slice(&md.to_le_bytes());
+    }
+
+    match flags & 0x03 {
+        0x00 => buf.push(total_msg_bytes as u8),
+        0x01 => buf.extend_from_slice(&(total_msg_bytes as u16).to_le_bytes()),
+        0x02 => buf.extend_from_slice(&(total_msg_bytes as u32).to_le_bytes()),
+        _ => unreachable!(),
+    }
+
+    // Write messages with 6-byte headers (includes 2-byte creation_order=0).
+    for (type_id, body, msg_flags) in messages {
+        buf.push(*type_id);
+        buf.extend_from_slice(&(body.len() as u16).to_le_bytes());
+        buf.push(*msg_flags);
+        buf.extend_from_slice(&0u16.to_le_bytes()); // creation_order = 0
+        buf.extend_from_slice(body);
+    }
+
+    // Pad with NIL message or gap.
+    let nil_bytes = total_msg_bytes - real_msg_bytes;
+    if nil_bytes >= 6 {
+        let nil_body_len = nil_bytes - 6;
+        buf.push(0x00); // type NIL
+        buf.extend_from_slice(&(nil_body_len as u16).to_le_bytes());
+        buf.push(0x00); // flags
+        buf.extend_from_slice(&0u16.to_le_bytes()); // creation_order
+        buf.resize(buf.len() + nil_body_len, 0);
+    } else if nil_bytes > 0 {
+        buf.resize(buf.len() + nil_bytes, 0); // gap
+    }
+
+    let cksum = crate::checksum::lookup3(&buf);
+    buf.extend_from_slice(&cksum.to_le_bytes());
+    Ok(buf)
+}
+
+/// Encode an OCHK (object header continuation chunk).
+///
+/// Messages use 6-byte headers when creation order is tracked.
+pub(crate) fn encode_ochk_creation_order(messages: &[OhdrMsg]) -> Vec<u8> {
+    let msg_bytes: usize = messages.iter().map(|(_, b, _)| 6 + b.len()).sum();
+    let total = 4 + msg_bytes + 4; // sig + messages + cksum
+    let mut buf = Vec::with_capacity(total);
+    buf.extend_from_slice(b"OCHK");
+    for (type_id, body, msg_flags) in messages {
+        buf.push(*type_id);
+        buf.extend_from_slice(&(body.len() as u16).to_le_bytes());
+        buf.push(*msg_flags);
+        buf.extend_from_slice(&0u16.to_le_bytes()); // creation_order = 0
+        buf.extend_from_slice(body);
+    }
+    let cksum = crate::checksum::lookup3(&buf);
+    buf.extend_from_slice(&cksum.to_le_bytes());
+    buf
+}
+
 /// Encode Fill Value message.
 ///
 /// When `compat` is true, use late space allocation (matching the C library default for contiguous).
@@ -662,6 +858,30 @@ pub(crate) fn encode_filter_pipeline(chunk_filters: &[ChunkFilter], element_size
                 buf.extend_from_slice(&filters::FILTER_FLETCHER32.to_le_bytes());
                 buf.extend_from_slice(&0u16.to_le_bytes()); // mandatory (C library default)
                 buf.extend_from_slice(&0u16.to_le_bytes());
+            }
+            ChunkFilter::ScaleOffset(params) => {
+                buf.extend_from_slice(&filters::FILTER_SCALEOFFSET.to_le_bytes());
+                buf.extend_from_slice(&1u16.to_le_bytes()); // optional flag
+                buf.extend_from_slice(&20u16.to_le_bytes()); // 20 cd_values
+                for &v in &params.cd_values {
+                    buf.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+            ChunkFilter::Nbit(params) => {
+                buf.extend_from_slice(&filters::FILTER_NBIT.to_le_bytes());
+                buf.extend_from_slice(&1u16.to_le_bytes()); // optional flag
+                buf.extend_from_slice(&(params.cd_values.len() as u16).to_le_bytes());
+                for &v in &params.cd_values {
+                    buf.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+            ChunkFilter::Lzf => {
+                buf.extend_from_slice(&filters::FILTER_LZF.to_le_bytes());
+                // Third-party filter (id >= 256): name_length + flags + ncv + name + cd_values
+                buf.extend_from_slice(&4u16.to_le_bytes()); // name_length including NUL
+                buf.extend_from_slice(&1u16.to_le_bytes()); // flags: 1 = optional
+                buf.extend_from_slice(&0u16.to_le_bytes()); // ncv: 0 cd_values
+                buf.extend_from_slice(b"lzf\0"); // name (no padding in v2)
             }
         }
     }
